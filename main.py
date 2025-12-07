@@ -21,13 +21,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Настройки ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI")
 if not BOT_TOKEN:
     logger.error("❌ ОШИБКА: BOT_TOKEN не задан. Добавьте переменную окружения в Render.")
     sys.exit(1)
 
 ADMIN_IDS = [5064426902]  # Замените на свой ID
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 # --- Потокобезопасная работа с базой данных ---
 class DatabaseManager:
@@ -126,20 +126,72 @@ def mod_kb(user_id):
 def start(message):
     """Обработка команды /start"""
     welcome_text = (
-        "👋 Привет! Я бот для отправки контента.\n\n"
-        "📋 **Как пользоваться:**\n"
-        "1. Нажмите кнопку ниже и выберите раздел\n"
-        "2. Отправьте фото или видео\n"
-        "3. Дождитесь модерации\n\n"
-        "Ваш контент увидят только после проверки администратором."
+        "👋 *Привет! Я бот для отправки контента.*\n\n"
+        "📋 *Как пользоваться:*\n"
+        "1. 👇 Нажмите кнопку ниже и выберите раздел\n"
+        "2. 📸 Отправьте фото или видео прямо в этот чат\n"
+        "3. ⏳ Дождитесь модерации\n"
+        "4. ✅ Получите уведомление о результате\n\n"
+        "⚠️ *Важно:* Ваш контент увидят только после проверки администратором.\n\n"
+        "📊 Проверить статус: /status\n"
+        "🔄 Сбросить раздел: /reset"
     )
     
-    bot.send_message(
-        message.chat.id,
-        welcome_text,
-        reply_markup=section_kb()
+    try:
+        bot.send_message(
+            message.chat.id,
+            welcome_text,
+            reply_markup=section_kb()
+        )
+        logger.info(f"Пользователь {message.from_user.id} начал диалог")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке приветствия: {e}")
+
+@bot.message_handler(commands=["status"])
+def status_command(message):
+    """Проверка статуса пользователя"""
+    uid = message.from_user.id
+    user_data = db.fetchone(
+        "SELECT section, approved FROM users WHERE user_id = ?",
+        (uid,)
     )
-    logger.info(f"Пользователь {message.from_user.id} начал диалог")
+    
+    if user_data:
+        section_name, approved = user_data
+        status_text = {
+            0: "⏳ Ожидает модерации",
+            1: "✅ Одобрено",
+            -1: "❌ Заблокирован"
+        }.get(approved, "❓ Неизвестный статус")
+        
+        response = (
+            f"📊 *Ваш статус:*\n\n"
+            f"👤 ID: `{uid}`\n"
+            f"📂 Раздел: {section_name}\n"
+            f"📈 Статус: {status_text}\n\n"
+            f"_Используйте /start для смены раздела_"
+        )
+    else:
+        response = (
+            "❌ *Вы еще не выбрали раздел.*\n\n"
+            "Используйте /start для выбора раздела."
+        )
+    
+    bot.reply_to(message, response)
+
+@bot.message_handler(commands=["reset"])
+def reset_command(message):
+    """Сброс выбранного раздела"""
+    uid = message.from_user.id
+    db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+    
+    response = (
+        "🔄 *Раздел сброшен!*\n\n"
+        "Теперь вы можете выбрать новый раздел:"
+    )
+    
+    bot.send_message(message.chat.id, response, reply_markup=section_kb())
+    logger.info(f"Пользователь {uid} сбросил раздел")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
 def section_handler(call):
@@ -148,7 +200,11 @@ def section_handler(call):
         bot.answer_callback_query(call.id, "Раздел выбран!")
         
         if not call.data or "_" not in call.data:
-            bot.send_message(call.message.chat.id, "❌ Ошибка выбора раздела")
+            bot.edit_message_text(
+                "❌ Ошибка выбора раздела",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
             return
             
         section_name = call.data.split("_", 1)[1]
@@ -157,7 +213,11 @@ def section_handler(call):
         # Проверяем валидность раздела
         valid_sections = ["пары", "будуар", "гараж"]
         if section_name.lower() not in valid_sections:
-            bot.send_message(call.message.chat.id, "❌ Неверный раздел")
+            bot.edit_message_text(
+                "❌ Неверный раздел",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
             return
         
         # Сохраняем в БД
@@ -168,43 +228,39 @@ def section_handler(call):
         
         logger.info(f"Пользователь {uid} выбрал раздел: {section_name}")
         
-        # Пытаемся отправить сообщение в личку
+        # Обновляем сообщение
+        success_text = (
+            f"✅ *Вы выбрали раздел: {section_name}*\n\n"
+            "📸 *Теперь отправьте фото или видео прямо в этот чат.*\n\n"
+            "_Бот обработает вашу заявку и отправит её на модерацию._"
+        )
+        
         try:
-            bot.send_message(
-                uid,
-                f"✅ Вы выбрали раздел: **{section_name}**\n\n"
-                "📸 Теперь отправьте фото или видео для модерации.",
-                parse_mode="Markdown"
+            bot.edit_message_text(
+                success_text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None  # Убираем клавиатуру после выбора
             )
-        except apihelper.ApiTelegramException as e:
-            if e.error_code == 403 and "blocked" in e.description.lower():
-                error_msg = "❌ Бот заблокирован. Разблокируйте бота, чтобы продолжить."
-            elif e.error_code == 403 and "can't initiate conversation" in e.description:
-                error_msg = (
-                    "⚠️ **Внимание!**\n\n"
-                    "Бот не может написать вам первым сообщением.\n"
-                    "1. Нажмите кнопку 'Начать' (@username бота)\n"
-                    "2. Или отправьте /start прямо мне"
-                )
-            else:
-                error_msg = "⚠️ Ошибка отправки сообщения"
-            
+        except Exception as e:
+            # Если не удалось отредактировать сообщение
+            logger.warning(f"Не удалось отредактировать сообщение: {e}")
             bot.send_message(
                 call.message.chat.id,
-                error_msg,
-                reply_markup=section_kb()
+                success_text
             )
-            logger.warning(f"Не удалось отправить сообщение пользователю {uid}: {e}")
             
     except Exception as e:
         logger.error(f"Ошибка в section_handler: {e}")
         bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
 
-@bot.message_handler(content_types=["photo", "video", "animation"])
+@bot.message_handler(content_types=["photo", "video", "animation", "document"])
 def media_handler(message):
     """Обработка медиафайлов"""
     try:
         uid = message.from_user.id
+        username = message.from_user.username
+        first_name = message.from_user.first_name
         
         # Проверяем, выбрал ли пользователь раздел
         user_data = db.fetchone(
@@ -213,9 +269,11 @@ def media_handler(message):
         )
         
         if not user_data:
+            # Если раздел не выбран, показываем клавиатуру
             bot.reply_to(
                 message,
-                "❌ Сначала выберите раздел!",
+                "❌ *Сначала выберите раздел!*\n\n"
+                "Нажмите на кнопку ниже:",
                 reply_markup=section_kb()
             )
             return
@@ -224,29 +282,40 @@ def media_handler(message):
         
         # Проверяем, не забанен ли пользователь
         if approved == -1:
-            bot.reply_to(message, "❌ Вы заблокированы и не можете отправлять контент.")
+            bot.reply_to(
+                message, 
+                "❌ *Вы заблокированы и не можете отправлять контент.*\n\n"
+                "Обратитесь к администратору для разблокировки."
+            )
             return
         
         logger.info(f"Медиа от пользователя {uid}, раздел: {section_name}")
         
         # Отправляем админам
+        submission_time = datetime.now().strftime("%H:%M:%S")
         for admin_id in ADMIN_IDS:
             try:
                 # Отправляем информацию о пользователе
                 user_info = (
-                    f"📨 **Новая анкета на модерацию**\n"
-                    f"👤 ID: `{uid}`\n"
-                    f"📂 Раздел: {section_name}\n"
-                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}"
+                    f"📨 *Новая анкета на модерацию*\n\n"
+                    f"👤 *Пользователь:*\n"
+                    f"ID: `{uid}`\n"
+                    f"Имя: {first_name}\n"
+                    f"Ник: @{username if username else 'нет'}\n\n"
+                    f"📂 *Раздел:* {section_name}\n"
+                    f"🕒 *Время:* {submission_time}\n\n"
+                    f"📎 *Тип:* {message.content_type}"
                 )
                 
-                bot.send_message(admin_id, user_info, parse_mode="Markdown")
+                bot.send_message(admin_id, user_info)
                 
                 # Пересылаем медиа
                 bot.forward_message(admin_id, message.chat.id, message.message_id)
                 
                 # Клавиатура модерации
-                bot.send_message(admin_id, "📋 Модерация:", reply_markup=mod_kb(uid))
+                bot.send_message(admin_id, "📋 *Модерация:*", reply_markup=mod_kb(uid))
+                
+                logger.info(f"Уведомление отправлено админу {admin_id}")
                 
             except Exception as e:
                 logger.error(f"Не удалось отправить админу {admin_id}: {e}")
@@ -254,8 +323,9 @@ def media_handler(message):
         # Подтверждение пользователю
         bot.reply_to(
             message,
-            "✅ Ваша анкета отправлена на модерацию.\n"
-            "Ожидайте решения администратора."
+            "✅ *Ваша анкета отправлена на модерацию!*\n\n"
+            "⏳ *Ожидайте решения администратора.*\n\n"
+            "_Вы получите уведомление о результате._"
         )
         
     except Exception as e:
@@ -281,6 +351,14 @@ def moderation_handler(call):
         action, uid_str = parts
         uid = int(uid_str)
         
+        # Получаем информацию о пользователе
+        user_data = db.fetchone(
+            "SELECT section FROM users WHERE user_id = ?",
+            (uid,)
+        )
+        
+        section_name = user_data[0] if user_data else "неизвестно"
+        
         # Обновляем статус в БД
         if action == "app":
             db.execute(
@@ -289,7 +367,9 @@ def moderation_handler(call):
             )
             status_text = "✅ Одобрена"
             user_message = (
-                "🎉 **Ваша анкета одобрена!**\n\n"
+                "🎉 *Ваша анкета одобрена!*\n\n"
+                "✅ *Статус:* Одобрено администратором\n"
+                f"📂 *Раздел:* {section_name}\n\n"
                 "Теперь ваш контент будет доступен другим пользователям."
             )
         else:  # rej
@@ -298,30 +378,39 @@ def moderation_handler(call):
                 (uid,)
             )
             status_text = "❌ Отклонена"
-            user_message = "❌ Ваша анкета отклонена администратором."
+            user_message = (
+                "❌ *Ваша анкета отклонена.*\n\n"
+                "🔄 Вы можете отправить новый контент, но сначала выберите раздел: /start"
+            )
         
         # Отправляем решение пользователю
         try:
             bot.send_message(uid, user_message)
+            logger.info(f"Решение отправлено пользователю {uid}: {action}")
         except apihelper.ApiTelegramException as e:
-            if e.error_code != 403:  # Игнорируем, если пользователь заблокировал бота
-                logger.warning(f"Не удалось уведомить пользователя {uid}: {e}")
+            if e.error_code == 403:
+                logger.warning(f"Пользователь {uid} заблокировал бота")
+            else:
+                logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
         
         # Обновляем сообщение админу
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=f"📋 **Модерация завершена**\n\n"
-                     f"👤 Пользователь: `{uid}`\n"
-                     f"📊 Решение: {status_text}\n"
-                     f"👨‍💼 Модератор: {call.from_user.first_name}",
-                parse_mode="Markdown"
+                text=(
+                    f"📋 *Модерация завершена*\n\n"
+                    f"👤 *Пользователь:* `{uid}`\n"
+                    f"📂 *Раздел:* {section_name}\n"
+                    f"📊 *Решение:* {status_text}\n"
+                    f"👨‍💼 *Модератор:* {call.from_user.first_name}\n\n"
+                    f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}"
+                )
             )
-        except:
-            pass  # Если не удалось редактировать сообщение
+        except Exception as e:
+            logger.warning(f"Не удалось отредактировать сообщение: {e}")
         
-        logger.info(f"Модерация: {action} для пользователя {uid}")
+        logger.info(f"Модерация: {action} для пользователя {uid}, раздел: {section_name}")
         
     except Exception as e:
         logger.error(f"Ошибка в moderation_handler: {e}")
@@ -330,14 +419,38 @@ def moderation_handler(call):
 @bot.message_handler(func=lambda message: True)
 def other_messages(message):
     """Обработка всех остальных сообщений"""
-    if message.text.startswith('/'):
-        bot.reply_to(message, "❌ Неизвестная команда. Используйте /start")
-    else:
+    if message.text and message.text.startswith('/'):
         bot.reply_to(
             message,
-            "Отправьте фото или видео после выбора раздела.",
-            reply_markup=section_kb()
+            "❌ *Неизвестная команда.*\n\n"
+            "Доступные команды:\n"
+            "/start - Начать работу с ботом\n"
+            "/status - Проверить статус\n"
+            "/reset - Сбросить раздел\n"
+            "/help - Помощь"
         )
+    elif message.text:
+        # Если текст не команда, проверяем статус пользователя
+        uid = message.from_user.id
+        user_data = db.fetchone(
+            "SELECT section FROM users WHERE user_id = ?",
+            (uid,)
+        )
+        
+        if user_data:
+            bot.reply_to(
+                message,
+                "📸 *Отправьте фото или видео для модерации.*\n\n"
+                f"Ваш текущий раздел: {user_data[0]}\n\n"
+                "Изменить раздел: /start"
+            )
+        else:
+            bot.reply_to(
+                message,
+                "👋 *Сначала выберите раздел!*\n\n"
+                "Используйте /start для начала работы.",
+                reply_markup=section_kb()
+            )
 
 # --- Flask health-check server (для Render Web Service) ---
 app = Flask(__name__)
@@ -348,11 +461,40 @@ def health_check():
 
 @app.route('/health')
 def health():
+    """Endpoint для проверки здоровья приложения"""
+    # Проверяем соединение с БД
+    try:
+        test_result = db.fetchone("SELECT 1")
+        db_status = "connected" if test_result else "error"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
     return {
         "status": "alive",
         "timestamp": datetime.now().isoformat(),
-        "service": "telegram-bot"
+        "service": "telegram-bot",
+        "database": db_status,
+        "admins_count": len(ADMIN_IDS)
     }, 200
+
+@app.route('/stats')
+def stats():
+    """Статистика бота (только для админов)"""
+    try:
+        total_users = db.fetchone("SELECT COUNT(*) FROM users")[0]
+        pending = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 0")[0]
+        approved = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 1")[0]
+        rejected = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = -1")[0]
+        
+        return {
+            "total_users": total_users,
+            "pending_moderation": pending,
+            "approved": approved,
+            "rejected": rejected,
+            "timestamp": datetime.now().isoformat()
+        }, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 def run_flask():
     """Запуск Flask в отдельном потоке"""
@@ -384,7 +526,14 @@ if __name__ == '__main__':
     
     logger.info("=" * 50)
     logger.info("🚀 Запуск Telegram бота")
-    logger.info(f"🤖 Бот: @{bot.get_me().username}")
+    
+    try:
+        bot_info = bot.get_me()
+        logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
+    except Exception as e:
+        logger.error(f"Не удалось получить информацию о боте: {e}")
+        sys.exit(1)
+    
     logger.info(f"👨‍💼 Админы: {ADMIN_IDS}")
     logger.info("=" * 50)
     
@@ -394,8 +543,16 @@ if __name__ == '__main__':
     
     # Запускаем бота
     try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        logger.info("🔄 Начинаем polling...")
+        bot.infinity_polling(
+            timeout=60,
+            long_polling_timeout=30,
+            logger_level=logging.WARNING  # Уменьшаем логирование библиотеки
+        )
+    except KeyboardInterrupt:
+        logger.info("⏹ Остановка по запросу пользователя...")
     except Exception as e:
         logger.error(f"Критическая ошибка бота: {e}")
+        sys.exit(1)
     finally:
-        logger.info("Бот остановлен")
+        logger.info("🤖 Бот остановлен")
