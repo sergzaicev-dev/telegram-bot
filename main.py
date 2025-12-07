@@ -6,16 +6,16 @@ import sqlite3
 import threading
 from flask import Flask
 
-# --- Настройки ---
+# === Настройки ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    print("❌ ОШИБКА: BOT_TOKEN не задан. Добавьте переменную окружения в Render.")
+    print("BOT_TOKEN отсутствует")
     exit(1)
 
 ADMIN_IDS = [5064426902]
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- База данных ---
+# === SQLite ===
 conn = sqlite3.connect('users.db', check_same_thread=False)
 c = conn.cursor()
 c.execute("""
@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
-# --- Клавиатуры ---
+# === Клавиатуры ===
 def section_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Пары", callback_data="sec_пары"))
@@ -41,57 +41,60 @@ def mod_kb(user_id):
     kb.add(InlineKeyboardButton("Отклонить", callback_data=f"rej_{user_id}"))
     return kb
 
-# --- Хендлеры бота ---
+# === Handlers ===
 @bot.message_handler(commands=["start"])
 def start(message):
     uid = message.from_user.id
-    # Добавляем пользователя в БД при первом /start
-    c.execute("INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
-              (uid, ""))
-    conn.commit()
-    
-    bot.send_message(
-        message.chat.id,
-        "👋 Привет! Выберите раздел:",
-        reply_markup=section_kb()
-    )
+
+    # Проверяем есть ли пользователь
+    c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
+    row = c.fetchone()
+
+    if not row:
+        c.execute("INSERT INTO users (user_id, section, approved) VALUES (?, ?, 0)",
+                  (uid, ""))
+        conn.commit()
+
+    bot.send_message(message.chat.id, "Выберите раздел:", reply_markup=section_kb())
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
 def section(call):
-    bot.answer_callback_query(call.id)  # ← критически важно для отзывчивости кнопок
-    section_name = call.data.split("_")[1]
+    bot.answer_callback_query(call.id)
     uid = call.from_user.id
+    section_name = call.data.split("_")[1]
 
-    c.execute("INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
-              (uid, section_name))
+    # Обновляем только section — approved не трогаем
+    c.execute("UPDATE users SET section=? WHERE user_id=?", (section_name, uid))
     conn.commit()
 
     try:
-        bot.send_message(uid, "📸 Пришлите 1 фото или видео.")
-    except apihelper.ApiTelegramException as e:
-        if e.error_code == 403 and "can't initiate conversation" in e.description:
-            bot.send_message(
-                call.message.chat.id,
-                "⚠️ Сначала нажмите /start, чтобы разрешить боту писать вам.",
-                reply_markup=section_kb()
-            )
-        else:
-            raise
+        bot.send_message(uid, "Пришлите 1 фото или видео.")
+    except apihelper.ApiTelegramException:
+        bot.send_message(
+            call.message.chat.id,
+            "Нажмите /start чтобы бот смог отправлять вам сообщения."
+        )
+
 
 @bot.message_handler(content_types=["photo", "video"])
 def media(message):
     uid = message.from_user.id
-    c.execute("SELECT approved FROM users WHERE user_id=?", (uid,))
+
+    c.execute("SELECT section FROM users WHERE user_id=?", (uid,))
     row = c.fetchone()
-    if not row:
+
+    if not row or not row[0]:
         bot.send_message(uid, "Сначала выберите раздел.", reply_markup=section_kb())
         return
 
     for admin in ADMIN_IDS:
-        bot.send_message(admin, f"📨 Новая анкета от {uid}")
+        bot.send_message(admin, f"Новая анкета от {uid}")
         bot.forward_message(admin, message.chat.id, message.message_id)
         bot.send_message(admin, "Модерация:", reply_markup=mod_kb(uid))
-    bot.send_message(uid, "✅ Анкета отправлена на модерацию.")
+
+    bot.send_message(uid, "Анкета отправлена на модерацию.")
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("app_") or c.data.startswith("rej_"))
 def approve(call):
@@ -101,36 +104,27 @@ def approve(call):
 
     action, uid = call.data.split("_")
     uid = int(uid)
+
     if action == "app":
         c.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
         conn.commit()
-        try:
-            bot.send_message(uid, "✅ Анкета одобрена!")
-        except apihelper.ApiTelegramException:
-            pass  # пользователь заблокировал — не критично
+        bot.send_message(uid, "Анкета одобрена!")
     else:
-        try:
-            bot.send_message(uid, "❌ Анкета отклонена.")
-        except apihelper.ApiTelegramException:
-            pass
+        bot.send_message(uid, "Анкета отклонена.")
 
-# --- Flask health-check server (для Render Web Service) ---
+
+# === Flask для Render ===
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
     return "OK", 200
 
-@app.route('/health')
-def health():
-    return {"status": "alive", "bot": "running"}, 200
-
 def run_flask():
     port = int(os.getenv("PORT", 8000))
     app.run(host='0.0.0.0', port=port)
 
-# --- Запуск ---
-if __name__ == '__main__':
+# === Запуск ===
+if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("✅ Бот запущен. Ожидание сообщений...")
     bot.infinity_polling()
