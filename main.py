@@ -44,9 +44,15 @@ def mod_kb(user_id):
 # --- Хендлеры бота ---
 @bot.message_handler(commands=["start"])
 def start(message):
+    uid = message.from_user.id
+    # Добавляем пользователя в БД при первом /start
+    c.execute("INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
+              (uid, ""))
+    conn.commit()
+    
     bot.send_message(
         message.chat.id,
-        "👋 Привет! Чтобы бот мог отправлять вам сообщения, сначала нажмите /start, затем выберите раздел.",
+        "👋 Привет! Выберите раздел:",
         reply_markup=section_kb()
     )
 
@@ -100,9 +106,8 @@ def approve(call):
         conn.commit()
         try:
             bot.send_message(uid, "✅ Анкета одобрена!")
-        except apihelper.ApiTelegramException as e:
-            if e.error_code == 403:
-                pass  # пользователь заблокировал — не критично
+        except apihelper.ApiTelegramException:
+            pass  # пользователь заблокировал — не критично
     else:
         try:
             bot.send_message(uid, "❌ Анкета отклонена.")
