@@ -1,130 +1,146 @@
-import os
-import telebot
-from telebot import apihelper
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import sqlite3
-import threading
-from flask import Flask
+import logging
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# === Настройки ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("BOT_TOKEN отсутствует")
-    exit(1)
+logging.basicConfig(level=logging.INFO)
 
-ADMIN_IDS = [5064426902]
-bot = telebot.TeleBot(BOT_TOKEN)
+# Этапы
+SELECT_SECTION, WAIT_MEDIA, WAIT_APPROVAL = range(3)
 
-# === SQLite ===
-conn = sqlite3.connect('users.db', check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    section TEXT,
-    approved INTEGER DEFAULT 0
-)
-""")
-conn.commit()
+# Хранилище состояния
+users = {}
 
-# === Клавиатуры ===
-def section_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Пары", callback_data="sec_пары"))
-    kb.add(InlineKeyboardButton("Будуар", callback_data="sec_будуар"))
-    kb.add(InlineKeyboardButton("Гараж", callback_data="sec_гараж"))
-    return kb
-
-def mod_kb(user_id):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Одобрить", callback_data=f"app_{user_id}"))
-    kb.add(InlineKeyboardButton("Отклонить", callback_data=f"rej_{user_id}"))
-    return kb
-
-# === Handlers ===
-@bot.message_handler(commands=["start"])
-def start(message):
-    uid = message.from_user.id
-
-    # Проверяем есть ли пользователь
-    c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
-    row = c.fetchone()
-
-    if not row:
-        c.execute("INSERT INTO users (user_id, section, approved) VALUES (?, ?, 0)",
-                  (uid, ""))
-        conn.commit()
-
-    bot.send_message(message.chat.id, "Выберите раздел:", reply_markup=section_kb())
+ADMIN_ID = 5064426902  # <-- Замените на ваш Telegram ID
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
-def section(call):
-    bot.answer_callback_query(call.id)
-    uid = call.from_user.id
-    section_name = call.data.split("_")[1]
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-    # Обновляем только section — approved не трогаем
-    c.execute("UPDATE users SET section=? WHERE user_id=?", (section_name, uid))
-    conn.commit()
+    users[user_id] = {
+        "section": None,
+        "media_uploaded": False,
+        "approved": False
+    }
 
-    try:
-        bot.send_message(uid, "Пришлите 1 фото или видео.")
-    except apihelper.ApiTelegramException:
-        bot.send_message(
-            call.message.chat.id,
-            "Нажмите /start чтобы бот смог отправлять вам сообщения."
-        )
+    keyboard = [["Пары", "Будуар", "Гараж"]]
+    await update.message.reply_text(
+        "Выберите раздел для анкеты:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+    )
+
+    return SELECT_SECTION
 
 
-@bot.message_handler(content_types=["photo", "video"])
-def media(message):
-    uid = message.from_user.id
+async def choose_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    section = update.message.text.strip()
 
-    c.execute("SELECT section FROM users WHERE user_id=?", (uid,))
-    row = c.fetchone()
+    if section not in ["Пары", "Будуар", "Гараж"]:
+        await update.message.reply_text("Выберите один из вариантов.")
+        return SELECT_SECTION
 
-    if not row or not row[0]:
-        bot.send_message(uid, "Сначала выберите раздел.", reply_markup=section_kb())
+    users[user_id]["section"] = section
+
+    await update.message.reply_text(
+        f"Раздел выбран: {section}\nТеперь загрузите фото или видео."
+    )
+
+    return WAIT_MEDIA
+
+
+async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not (update.message.photo or update.message.video):
+        await update.message.reply_text("Нужно фото или видео.")
+        return WAIT_MEDIA
+
+    users[user_id]["media_uploaded"] = True
+
+    await update.message.reply_text("Анкета отправлена на модерацию.")
+
+    # Отправка админу
+    msg = f"Новая анкета от {user_id}\nРаздел: {users[user_id]['section']}"
+    await context.bot.send_message(chat_id=ADMIN_ID, text=msg)
+
+    # Пересылка медиа админу
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        await context.bot.send_photo(chat_id=ADMIN_ID, photo=file_id)
+    elif update.message.video:
+        file_id = update.message.video.file_id
+        await context.bot.send_video(chat_id=ADMIN_ID, video=file_id)
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"Чтобы одобрить: /approve_{user_id}"
+    )
+
+    return WAIT_APPROVAL
+
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    if not text.startswith("/approve_"):
         return
 
-    for admin in ADMIN_IDS:
-        bot.send_message(admin, f"Новая анкета от {uid}")
-        bot.forward_message(admin, message.chat.id, message.message_id)
-        bot.send_message(admin, "Модерация:", reply_markup=mod_kb(uid))
-
-    bot.send_message(uid, "Анкета отправлена на модерацию.")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("app_") or c.data.startswith("rej_"))
-def approve(call):
-    bot.answer_callback_query(call.id)
-    if call.from_user.id not in ADMIN_IDS:
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    action, uid = call.data.split("_")
-    uid = int(uid)
+    user_id = int(text.replace("/approve_", ""))
 
-    if action == "app":
-        c.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
-        conn.commit()
-        bot.send_message(uid, "Анкета одобрена!")
-    else:
-        bot.send_message(uid, "Анкета отклонена.")
+    if user_id not in users:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+
+    users[user_id]["approved"] = True
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="Ваша анкета одобрена. Доступ к разделам открыт."
+    )
+
+    await update.message.reply_text(f"Пользователь {user_id} одобрен.")
 
 
-# === Flask для Render ===
-app = Flask(__name__)
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-@app.route('/')
-def health_check():
-    return "OK", 200
+    if user_id not in users:
+        await update.message.reply_text("Введите /start")
+        return
 
-def run_flask():
-    port = int(os.getenv("PORT", 8000))
-    app.run(host='0.0.0.0', port=port)
+    if not users[user_id]["approved"]:
+        await update.message.reply_text("Вы ещё не прошли модерацию.")
+        return
 
-# === Запуск ===
+    await update.message.reply_text("Доступ открыт. Что хотите дальше?")
+
+
+def main():
+    app = ApplicationBuilder().token("8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI").build()
+
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CommandHandler("approve_", approve))
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            SELECT_SECTION: [MessageHandler(filters.TEXT, choose_section)],
+            WAIT_MEDIA: [MessageHandler(filters.ALL, receive_media)],
+            WAIT_APPROVAL: [
+                MessageHandler(filters.COMMAND & filters.Regex("^/approve_"), approve)
+            ],
+        },
+        fallbacks=[]
+    )
+
+    app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.ALL, unknown))
+
+    app.run_polling()
+
+
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    bot.infinity_polling()
+    main()
