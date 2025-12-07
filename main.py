@@ -1,5 +1,6 @@
 import os
 import telebot
+from telebot import apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import sqlite3
 import threading
@@ -12,7 +13,6 @@ if not BOT_TOKEN:
     exit(1)
 
 ADMIN_IDS = [5064426902]  # ← измените, если нужно
-
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- База данных ---
@@ -44,16 +44,33 @@ def mod_kb(user_id):
 # --- Хендлеры бота ---
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(message.chat.id, "Выберите раздел:", reply_markup=section_kb())
+    bot.send_message(
+        message.chat.id,
+        "👋 Привет! Чтобы бот мог присылать вам уведомления, сначала нажмите /start, затем выберите раздел.",
+        reply_markup=section_kb()
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
 def section(call):
+    bot.answer_callback_query(call.id)  # ← критически важно для отзывчивости кнопок
     section_name = call.data.split("_")[1]
     uid = call.from_user.id
+
     c.execute("INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
               (uid, section_name))
     conn.commit()
-    bot.send_message(uid, "Пришлите 1 фото/видео.")
+
+    try:
+        bot.send_message(uid, "📸 Пришлите 1 фото или видео.")
+    except apihelper.ApiTelegramException as e:
+        if e.error_code == 403 and "can't initiate conversation" in e.description:
+            bot.send_message(
+                call.message.chat.id,
+                "⚠️ Сначала нажмите /start, чтобы разрешить боту писать вам.",
+                reply_markup=section_kb()
+            )
+        else:
+            raise
 
 @bot.message_handler(content_types=["photo", "video"])
 def media(message):
@@ -61,28 +78,38 @@ def media(message):
     c.execute("SELECT approved FROM users WHERE user_id=?", (uid,))
     row = c.fetchone()
     if not row:
-        bot.send_message(uid, "Сначала выберите раздел.")
+        bot.send_message(uid, "Сначала выберите раздел.", reply_markup=section_kb())
         return
+
     for admin in ADMIN_IDS:
-        bot.send_message(admin, f"Новая анкета: {uid}")
+        bot.send_message(admin, f"📨 Новая анкета от {uid}")
         bot.forward_message(admin, message.chat.id, message.message_id)
         bot.send_message(admin, "Модерация:", reply_markup=mod_kb(uid))
-    bot.send_message(uid, "Анкета отправлена на модерацию.")
+    bot.send_message(uid, "✅ Анкета отправлена на модерацию.")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("app_") or c.data.startswith("rej_"))
 def approve(call):
+    bot.answer_callback_query(call.id)
     if call.from_user.id not in ADMIN_IDS:
         return
+
     action, uid = call.data.split("_")
     uid = int(uid)
     if action == "app":
         c.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
         conn.commit()
-        bot.send_message(uid, "Анкета одобрена.")
+        try:
+            bot.send_message(uid, "✅ Анкета одобрена!")
+        except apihelper.ApiTelegramException as e:
+            if e.error_code == 403:
+                pass  # пользователь заблокировал — не критично
     else:
-        bot.send_message(uid, "Анкета отклонена.")
+        try:
+            bot.send_message(uid, "❌ Анкета отклонена.")
+        except apihelper.ApiTelegramException:
+            pass
 
-# --- Flask health-check server (обязательно для Render Web Service) ---
+# --- Flask health-check server (для Render Web Service) ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -97,7 +124,8 @@ def run_flask():
     port = int(os.getenv("PORT", 8000))
     app.run(host='0.0.0.0', port=port)
 
-# --- Запуск бота и сервера ---
+# --- Запуск ---
 if __name__ == '__main__':
     threading.Thread(target=run_flask, daemon=True).start()
+    print("✅ Бот запущен. Ожидание сообщений...")
     bot.infinity_polling()
