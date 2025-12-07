@@ -2,8 +2,8 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import sqlite3
 
-TOKEN = "YOUR_BOT_TOKEN"
-ADMIN_IDS = [123456789]
+TOKEN = "8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI"
+ADMIN_IDS = [5064426902]
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -20,20 +20,20 @@ conn.commit()
 
 def section_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Пары", callback_data="sec_пары"))
-    kb.add(InlineKeyboardButton("Будуар", callback_data="sec_будуар"))
-    kb.add(InlineKeyboardButton("Гараж", callback_data="sec_гараж"))
+    kb.add(InlineKeyboardButton("ГЏГ Г°Г»", callback_data="sec_ГЇГ Г°Г»"))
+    kb.add(InlineKeyboardButton("ГЃГіГ¤ГіГ Г°", callback_data="sec_ГЎГіГ¤ГіГ Г°"))
+    kb.add(InlineKeyboardButton("ГѓГ Г°Г Г¦", callback_data="sec_ГЈГ Г°Г Г¦"))
     return kb
 
 def mod_kb(user_id):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Одобрить", callback_data=f"app_{user_id}"))
-    kb.add(InlineKeyboardButton("Отклонить", callback_data=f"rej_{user_id}"))
+    kb.add(InlineKeyboardButton("ГЋГ¤Г®ГЎГ°ГЁГІГј", callback_data=f"app_{user_id}"))
+    kb.add(InlineKeyboardButton("ГЋГІГЄГ«Г®Г­ГЁГІГј", callback_data=f"rej_{user_id}"))
     return kb
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(message.chat.id, "Выберите раздел:", reply_markup=section_kb())
+    bot.send_message(message.chat.id, "Г‚Г»ГЎГҐГ°ГЁГІГҐ Г°Г Г§Г¤ГҐГ«:", reply_markup=section_kb())
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
 def section(call):
@@ -44,7 +44,7 @@ def section(call):
               (uid, section))
     conn.commit()
 
-    bot.send_message(uid, "Пришлите 1 фото/видео.")
+    bot.send_message(uid, "ГЏГ°ГЁГёГ«ГЁГІГҐ 1 ГґГ®ГІГ®/ГўГЁГ¤ГҐГ®.")
 
 @bot.message_handler(content_types=["photo", "video"])
 def media(message):
@@ -53,15 +53,15 @@ def media(message):
     c.execute("SELECT approved FROM users WHERE user_id=?", (uid,))
     row = c.fetchone()
     if not row:
-        bot.send_message(uid, "Сначала выберите раздел.")
+        bot.send_message(uid, "Г‘Г­Г Г·Г Г«Г  ГўГ»ГЎГҐГ°ГЁГІГҐ Г°Г Г§Г¤ГҐГ«.")
         return
 
     for admin in ADMIN_IDS:
-        bot.send_message(admin, f"Новая анкета: {uid}")
+        bot.send_message(admin, f"ГЌГ®ГўГ Гї Г Г­ГЄГҐГІГ : {uid}")
         bot.forward_message(admin, message.chat.id, message.message_id)
-        bot.send_message(admin, "Модерация:", reply_markup=mod_kb(uid))
+        bot.send_message(admin, "ГЊГ®Г¤ГҐГ°Г Г¶ГЁГї:", reply_markup=mod_kb(uid))
 
-    bot.send_message(uid, "Анкета отправлена на модерацию.")
+    bot.send_message(uid, "ГЂГ­ГЄГҐГІГ  Г®ГІГЇГ°Г ГўГ«ГҐГ­Г  Г­Г  Г¬Г®Г¤ГҐГ°Г Г¶ГЁГѕ.")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("app_") or c.data.startswith("rej_"))
 def approve(call):
@@ -74,8 +74,9 @@ def approve(call):
     if action == "app":
         c.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
         conn.commit()
-        bot.send_message(uid, "Анкета одобрена.")
+        bot.send_message(uid, "ГЂГ­ГЄГҐГІГ  Г®Г¤Г®ГЎГ°ГҐГ­Г .")
     else:
-        bot.send_message(uid, "Анкета отклонена.")
+        bot.send_message(uid, "ГЂГ­ГЄГҐГІГ  Г®ГІГЄГ«Г®Г­ГҐГ­Г .")
 
 bot.infinity_polling()
+
