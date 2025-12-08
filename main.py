@@ -9,7 +9,7 @@ from flask import Flask
 import signal
 import sys
 from datetime import datetime
-import time  # Важно добавить!
+import time
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -897,7 +897,4 @@ if __name__ == '__main__':
             logger.info(f"👥 Админы: {ADMIN_IDS}")
             break
         except Exception as e:
-            logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
-            if check_attempt < 2:
-                time.sleep(5)
-            else
+            logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 
