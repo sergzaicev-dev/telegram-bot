@@ -10,7 +10,6 @@ import signal
 import sys
 from datetime import datetime
 import time
-import multiprocessing
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -893,4 +892,9 @@ def run_bot():
                 logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
                 time.sleep(2)
         
-       
+        # Запускаем опрос обновлений
+        logger.info("🔄 Начинаю опрос обновлений...")
+        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка при запуске бота: {
