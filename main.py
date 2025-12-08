@@ -20,36 +20,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- НАСТРОЙКИ: ВСТАВЬТЕ ТОКЕН ЗДЕСЬ ---
-# Сначала пробуем получить токен из переменных окружения Render
+# --- НАСТРОЙКИ ---
+# Получаем токен ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Если на Render не настроен BOT_TOKEN, используем токен прямо из кода
-# ⚠️ ВНИМАНИЕ: Это временное решение! Настройте BOT_TOKEN на Render!
+# Если токен не найден - критическая ошибка
 if not BOT_TOKEN:
-    # ⬇️⬇️⬇️ ВСТАВЬТЕ ВАШ ТОКЕН В ЭТУ СТРОКУ ⬇️⬇️⬇️
-    # ⬆️⬆️⬆️ ВСТАВЬТЕ ВАШ ТОКЕН В ЭТУ СТРОКУ ⬆️⬆️⬆️
-    logger.warning("⚠️ Внимание: используется токен из кода. Настройте BOT_TOKEN на Render!")
-
-# Проверяем, что токен не пустой
-if not BOT_TOKEN or not BOT_TOKEN.strip():
-    logger.error("❌ ОШИБКА: BOT_TOKEN не задан.")
-    logger.info("📝 Решение: Добавьте BOT_TOKEN в Environment Variables на Render")
+    logger.error("❌ ОШИБКА: BOT_TOKEN не задан в переменных окружения.")
+    logger.info("📝 Как настроить на Render:")
+    logger.info("1. Dashboard → ваш_сервис → Environment")
+    logger.info("2. Add Environment Variable")
+    logger.info("3. Key: BOT_TOKEN")
+    logger.info("4. Value: ваш_токен_из_BotFather")
+    logger.info("5. Сохранить и перезапустить сервис")
     sys.exit(1)
 
-# Убираем возможные пробелы по краям
+# Убираем пробелы по краям (если есть)
 BOT_TOKEN = BOT_TOKEN.strip()
 
-# Проверяем формат токена (должно быть двоеточие)
+# Проверяем формат токена
 if ':' not in BOT_TOKEN:
-    logger.error(f"❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА: Нет двоеточия в '{BOT_TOKEN}'")
-    logger.info("Токен должен быть в формате: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz")
+    logger.error(f"❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
+    logger.error(f"Токен должен содержать двоеточие: 1234567890:ABCdefGHI...")
+    logger.error(f"Ваш токен: '{BOT_TOKEN}'")
     sys.exit(1)
 
-ADMIN_IDS = [5064426902]  # Ваш ID администратора
+ADMIN_IDS = [5064426902]  # Замените на ваш ID
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-logger.info(f"✅ Бот инициализирован. ID бота: {BOT_TOKEN.split(':')[0]}")
+logger.info(f"✅ Бот инициализирован. ID: {BOT_TOKEN.split(':')[0]}")
 # --- КОНЕЦ НАСТРОЕК ---
 
 # --- Потокобезопасная работа с базой данных ---
@@ -136,13 +135,14 @@ def section_kb():
     return kb
 
 def mod_kb(user_id):
-    """Клавиатура модерации для админов"""
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
+    """Клавиатура модерации для админов - УПРОЩЕННАЯ ВЕРСИЯ"""
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 2
+    markup.add(
         InlineKeyboardButton("✅ Одобрить", callback_data=f"app_{user_id}"),
         InlineKeyboardButton("❌ Отклонить", callback_data=f"rej_{user_id}")
     )
-    return kb
+    return markup
 
 # --- Хендлеры бота ---
 @bot.message_handler(commands=["start", "help"])
@@ -279,11 +279,16 @@ def section_handler(call):
 
 @bot.message_handler(content_types=["photo", "video", "animation", "document"])
 def media_handler(message):
-    """Обработка медиафайлов"""
+    """Обработка медиафайлов - ИСПРАВЛЕННАЯ ВЕРСИЯ С КНОПКАМИ"""
     try:
         uid = message.from_user.id
-        username = message.from_user.username
-        first_name = message.from_user.first_name
+        username = message.from_user.username or "нет"
+        first_name = message.from_user.first_name or "не указано"
+        
+        # Отладка
+        logger.info(f"=== ПОЛУЧЕНО МЕДИА ОТ {uid} ===")
+        logger.info(f"Тип: {message.content_type}")
+        logger.info(f"Имя: {first_name}, Ник: @{username}")
         
         # Проверяем, выбрал ли пользователь раздел
         user_data = db.fetchone(
@@ -312,36 +317,92 @@ def media_handler(message):
             )
             return
         
-        logger.info(f"Медиа от пользователя {uid}, раздел: {section_name}")
+        logger.info(f"Раздел пользователя: {section_name}, Статус: {approved}")
         
-        # Отправляем админам
+        # Отправляем админам - ОДНИМ СООБЩЕНИЕМ С КНОПКАМИ
         submission_time = datetime.now().strftime("%H:%M:%S")
+        
         for admin_id in ADMIN_IDS:
             try:
-                # Отправляем информацию о пользователе
-                user_info = (
+                # Создаем описание
+                caption = (
                     f"📨 *Новая анкета на модерацию*\n\n"
                     f"👤 *Пользователь:*\n"
                     f"ID: `{uid}`\n"
                     f"Имя: {first_name}\n"
-                    f"Ник: @{username if username else 'нет'}\n\n"
+                    f"Ник: @{username}\n\n"
                     f"📂 *Раздел:* {section_name}\n"
                     f"🕒 *Время:* {submission_time}\n\n"
                     f"📎 *Тип:* {message.content_type}"
                 )
                 
-                bot.send_message(admin_id, user_info)
+                # Отправляем в зависимости от типа медиа
+                if message.content_type == 'photo':
+                    # Берем самое большое фото
+                    file_id = message.photo[-1].file_id
+                    logger.info(f"Отправка фото админу {admin_id}")
+                    
+                    bot.send_photo(
+                        admin_id,
+                        file_id,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_markup=mod_kb(uid)
+                    )
+                    
+                elif message.content_type == 'video':
+                    file_id = message.video.file_id
+                    logger.info(f"Отправка видео админу {admin_id}")
+                    
+                    bot.send_video(
+                        admin_id,
+                        file_id,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_markup=mod_kb(uid)
+                    )
+                    
+                elif message.content_type == 'animation':  # GIF
+                    file_id = message.animation.file_id
+                    logger.info(f"Отправка GIF админу {admin_id}")
+                    
+                    bot.send_animation(
+                        admin_id,
+                        file_id,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_markup=mod_kb(uid)
+                    )
+                    
+                else:
+                    # Для других типов - пересылаем и кнопки отдельно
+                    logger.info(f"Пересылка {message.content_type} админу {admin_id}")
+                    bot.forward_message(admin_id, message.chat.id, message.message_id)
+                    
+                    # Отправляем кнопки отдельно
+                    bot.send_message(
+                        admin_id,
+                        f"{caption}\n\n📋 *Модерация:*",
+                        parse_mode="Markdown",
+                        reply_markup=mod_kb(uid)
+                    )
                 
-                # Пересылаем медиа
-                bot.forward_message(admin_id, message.chat.id, message.message_id)
-                
-                # Клавиатура модерации
-                bot.send_message(admin_id, "📋 *Модерация:*", reply_markup=mod_kb(uid))
-                
-                logger.info(f"Уведомление отправлено админу {admin_id}")
+                logger.info(f"✅ Уведомление с кнопками отправлено админу {admin_id}")
                 
             except Exception as e:
-                logger.error(f"Не удалось отправить админу {admin_id}: {e}")
+                logger.error(f"❌ Не удалось отправить админу {admin_id}: {e}")
+                # Пробуем простой вариант
+                try:
+                    bot.send_message(
+                        admin_id,
+                        f"📨 Новая анкета от {uid} ({first_name})\n"
+                        f"Раздел: {section_name}\n\n"
+                        f"Модерация:",
+                        reply_markup=mod_kb(uid)
+                    )
+                    bot.forward_message(admin_id, message.chat.id, message.message_id)
+                except Exception as e2:
+                    logger.error(f"❌ И fallback не сработал: {e2}")
         
         # Подтверждение пользователю
         bot.reply_to(
@@ -350,17 +411,22 @@ def media_handler(message):
             "⏳ *Ожидайте решения администратора.*\n\n"
             "_Вы получите уведомление о результате._"
         )
+        logger.info(f"✅ Пользователь {uid} получил подтверждение")
         
     except Exception as e:
-        logger.error(f"Ошибка в media_handler: {e}")
+        logger.error(f"❌ Ошибка в media_handler: {e}")
         bot.reply_to(message, "❌ Произошла ошибка при обработке медиа")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_")))
 def moderation_handler(call):
-    """Обработка модерации"""
+    """Обработка модерации - ИСПРАВЛЕННАЯ"""
     try:
+        logger.info(f"=== НАЧАЛО МОДЕРАЦИИ ===")
+        logger.info(f"Callback от: {call.from_user.id}, data: {call.data}")
+        
         # Проверяем права администратора
         if call.from_user.id not in ADMIN_IDS:
+            logger.warning(f"Попытка модерации от не-админа: {call.from_user.id}")
             bot.answer_callback_query(call.id, "❌ У вас нет прав!", show_alert=True)
             return
         
@@ -369,10 +435,13 @@ def moderation_handler(call):
         # Разбираем callback data
         parts = call.data.split("_")
         if len(parts) != 2:
+            logger.error(f"Неверный формат callback: {call.data}")
             return
         
         action, uid_str = parts
         uid = int(uid_str)
+        
+        logger.info(f"Действие: {action}, Пользователь: {uid}")
         
         # Получаем информацию о пользователе
         user_data = db.fetchone(
@@ -395,6 +464,7 @@ def moderation_handler(call):
                 f"📂 *Раздел:* {section_name}\n\n"
                 "Теперь ваш контент будет доступен другим пользователям."
             )
+            logger.info(f"✅ Анкета {uid} одобрена")
         else:  # rej
             db.execute(
                 "UPDATE users SET approved = -1 WHERE user_id = ?",
@@ -405,18 +475,19 @@ def moderation_handler(call):
                 "❌ *Ваша анкета отклонена.*\n\n"
                 "🔄 Вы можете отправить новый контент, но сначала выберите раздел: /start"
             )
+            logger.info(f"❌ Анкета {uid} отклонена")
         
         # Отправляем решение пользователю
         try:
-            bot.send_message(uid, user_message)
-            logger.info(f"Решение отправлено пользователю {uid}: {action}")
+            bot.send_message(uid, user_message, parse_mode="Markdown")
+            logger.info(f"✅ Решение отправлено пользователю {uid}")
         except apihelper.ApiTelegramException as e:
             if e.error_code == 403:
                 logger.warning(f"Пользователь {uid} заблокировал бота")
             else:
                 logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
         
-        # Обновляем сообщение админу
+        # Обновляем сообщение админу (убираем кнопки)
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
@@ -428,15 +499,26 @@ def moderation_handler(call):
                     f"📊 *Решение:* {status_text}\n"
                     f"👨‍💼 *Модератор:* {call.from_user.first_name}\n\n"
                     f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}"
-                )
+                ),
+                parse_mode="Markdown"
             )
+            logger.info(f"✅ Сообщение админу обновлено")
         except Exception as e:
-            logger.warning(f"Не удалось отредактировать сообщение: {e}")
+            logger.warning(f"Не удалось отредактировать сообщение админу: {e}")
+            # Пробуем отправить новое сообщение
+            try:
+                bot.send_message(
+                    call.from_user.id,
+                    f"✅ Модерация завершена\nПользователь: {uid}\nРешение: {status_text}",
+                    parse_mode="Markdown"
+                )
+            except Exception as e2:
+                logger.error(f"Не удалось отправить уведомление админу: {e2}")
         
-        logger.info(f"Модерация: {action} для пользователя {uid}, раздел: {section_name}")
+        logger.info(f"=== МОДЕРАЦИЯ ЗАВЕРШЕНА ===")
         
     except Exception as e:
-        logger.error(f"Ошибка в moderation_handler: {e}")
+        logger.error(f"❌ Ошибка в moderation_handler: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка!", show_alert=True)
 
 @bot.message_handler(func=lambda message: True)
@@ -553,16 +635,15 @@ if __name__ == '__main__':
     try:
         bot_info = bot.get_me()
         logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
-        logger.info(f"✅ Токен: {BOT_TOKEN.split(':')[0]}... (длина: {len(BOT_TOKEN)})")
+        logger.info(f"👥 Админы: {ADMIN_IDS}")
     except Exception as e:
         logger.error(f"Не удалось получить информацию о боте: {e}")
-        logger.error("Возможные причины:")
-        logger.error("1. Неправильный токен")
-        logger.error("2. Проблемы с сетью")
-        logger.error("3. Бот заблокирован в Telegram")
+        logger.error("Проверьте:")
+        logger.error("1. Правильность токена на Render")
+        logger.error("2. Что токен активен (не ревокнут)")
+        logger.error("3. Сетевое соединение")
         sys.exit(1)
     
-    logger.info(f"👨‍💼 Админы: {ADMIN_IDS}")
     logger.info("=" * 50)
     
     # Запускаем Flask в отдельном потоке
@@ -575,7 +656,7 @@ if __name__ == '__main__':
         bot.infinity_polling(
             timeout=60,
             long_polling_timeout=30,
-            logger_level=logging.WARNING  # Уменьшаем логирование библиотеки
+            logger_level=logging.WARNING
         )
     except KeyboardInterrupt:
         logger.info("⏹ Остановка по запросу пользователя...")
@@ -584,4 +665,3 @@ if __name__ == '__main__':
         sys.exit(1)
     finally:
         logger.info("🤖 Бот остановлен")
-
