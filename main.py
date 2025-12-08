@@ -9,7 +9,6 @@ from flask import Flask
 import signal
 import sys
 from datetime import datetime
-import time
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -41,8 +40,8 @@ BOT_TOKEN = BOT_TOKEN.strip()
 
 # Проверяем формат токена
 if ':' not in BOT_TOKEN:
-    logger.error("❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
-    logger.error("Токен должен содержать двоеточие: 1234567890:ABCdefGHI...")
+    logger.error(f"❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
+    logger.error(f"Токен должен содержать двоеточие: 1234567890:ABCdefGHI...")
     logger.error(f"Ваш токен: '{BOT_TOKEN}'")
     sys.exit(1)
 
@@ -59,14 +58,10 @@ class DatabaseManager:
         self.lock = threading.Lock()
         self._init_db()
     
-    def _get_conn(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        return conn
-
     def _init_db(self):
         """Инициализация базы данных"""
         with self.lock:
-            conn = self._get_conn()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -82,16 +77,12 @@ class DatabaseManager:
     def execute(self, query, params=()):
         """Безопасное выполнение запроса"""
         with self.lock:
-            conn = self._get_conn()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
                 conn.commit()
-                sql_type = query.strip().split()[0].upper()
-                if sql_type == "INSERT":
-                    result = cursor.lastrowid
-                else:
-                    result = cursor.rowcount
+                result = cursor.lastrowid
             except Exception as e:
                 logger.error(f"Ошибка БД: {e}")
                 result = None
@@ -102,7 +93,7 @@ class DatabaseManager:
     def fetchone(self, query, params=()):
         """Безопасное получение одной записи"""
         with self.lock:
-            conn = self._get_conn()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
@@ -117,7 +108,7 @@ class DatabaseManager:
     def fetchall(self, query, params=()):
         """Безопасное получение всех записей"""
         with self.lock:
-            conn = self._get_conn()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
@@ -134,7 +125,7 @@ db = DatabaseManager()
 
 # --- Клавиатуры ---
 def section_kb():
-    """Клавиатура выбора раздела для новых пользователей"""
+    """Клавиатура выбора раздела"""
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
         InlineKeyboardButton("Пары", callback_data="sec_пары"),
@@ -143,103 +134,40 @@ def section_kb():
     )
     return kb
 
-def approved_user_kb():
-    """Клавиатура для одобренных пользователей"""
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("📤 Отправить контент в свой раздел", callback_data="send_content"),
-        InlineKeyboardButton("🔄 Сменить раздел", callback_data="change_section"),
-        InlineKeyboardButton("📊 Мой статус", callback_data="my_status")
-    )
-    return kb
-
 def mod_kb(user_id):
     """Клавиатура модерации для админов"""
-    markup = InlineKeyboardMarkup()
-    markup.row_width = 2
-    markup.add(
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
         InlineKeyboardButton("✅ Одобрить", callback_data=f"app_{user_id}"),
         InlineKeyboardButton("❌ Отклонить", callback_data=f"rej_{user_id}")
     )
-    return markup
+    return kb
 
 # --- Хендлеры бота ---
 @bot.message_handler(commands=["start", "help"])
 def start(message):
-    """Обработка команды /start - РАЗНЫЕ СООБЩЕНИЯ ДЛЯ РАЗНЫХ СТАТУСОВ"""
-    uid = message.from_user.id
-    
-    # Проверяем статус пользователя
-    user_data = db.fetchone(
-        "SELECT section, approved FROM users WHERE user_id = ?",
-        (uid,)
+    """Обработка команды /start"""
+    welcome_text = (
+        "👋 *Привет! Я бот для отправки контента.*\n\n"
+        "📋 *Как пользоваться:*\n"
+        "1. 👇 Нажмите кнопку ниже и выберите раздел\n"
+        "2. 📸 Отправьте фото или видео прямо в этот чат\n"
+        "3. ⏳ Дождитесь модерации\n"
+        "4. ✅ Получите уведомление о результате\n\n"
+        "⚠️ *Важно:* Ваш контент увидят только после проверки администратором.\n\n"
+        "📊 Проверить статус: /status\n"
+        "🔄 Сбросить раздел: /reset"
     )
     
-    if user_data:
-        section_name, approved = user_data
-        
-        if approved == 1:
-            # ОДОБРЕННЫЙ пользователь
-            welcome_text = (
-                "🎉 *Добро пожаловать обратно!*\n\n"
-                f"✅ *Ваш статус:* **Одобрен**\n"
-                f"📂 *Ваш раздел:* **{section_name}**\n\n"
-                "*Доступные действия:*\n"
-                "• 📤 Отправлять контент в свой раздел\n"
-                "• 🔄 Сменить раздел (если нужно)\n"
-                "• 📊 Проверить свой статус\n\n"
-                "_Используйте кнопки ниже или команды:_\n"
-                "/content - Отправить контент\n"
-                "/change - Сменить раздел\n"
-                "/status - Мой статус"
-            )
-            
-            bot.send_message(
-                message.chat.id,
-                welcome_text,
-                reply_markup=approved_user_kb()
-            )
-            
-        elif approved == -1:
-            # ЗАБЛОКИРОВАННЫЙ пользователь
-            bot.send_message(
-                message.chat.id,
-                "❌ *Вы заблокированы.*\n\n"
-                "Обратитесь к администратору для разблокировки."
-            )
-            
-        else:
-            # НА МОДЕРАЦИИ (approved = 0)
-            welcome_text = (
-                "⏳ *Ваша анкета на модерации.*\n\n"
-                f"📂 *Выбранный раздел:* {section_name}\n"
-                "📊 *Статус:* Ожидает проверки администратором\n\n"
-                "Пожалуйста, подождите решения. "
-                "Вы получите уведомление как только администратор проверит вашу анкету."
-            )
-            bot.send_message(message.chat.id, welcome_text)
-            
-    else:
-        # НОВЫЙ пользователь
-        welcome_text = (
-            "👋 *Привет! Я бот для отправки контента.*\n\n"
-            "📋 *Как пользоваться:*\n"
-            "1. 👇 Нажмите кнопку ниже и выберите раздел\n"
-            "2. 📸 Отправьте фото или видео прямо в этот чат\n"
-            "3. ⏳ Дождитесь модерации\n"
-            "4. ✅ Получите уведомление о результате\n\n"
-            "⚠️ *Важно:* Ваш контент увидят только после проверки администратором.\n\n"
-            "📊 Проверить статус: /status\n"
-            "🔄 Сбросить раздел: /reset"
-        )
-        
+    try:
         bot.send_message(
             message.chat.id,
             welcome_text,
             reply_markup=section_kb()
         )
-    
-    logger.info(f"Пользователь {uid} начал диалог")
+        logger.info(f"Пользователь {message.from_user.id} начал диалог")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке приветствия: {e}")
 
 @bot.message_handler(commands=["status"])
 def status_command(message):
@@ -263,119 +191,20 @@ def status_command(message):
             f"👤 ID: `{uid}`\n"
             f"📂 Раздел: {section_name}\n"
             f"📈 Статус: {status_text}\n\n"
+            f"_Используйте /start для смены раздела_"
         )
-        
-        if approved == 1:
-            response += (
-                "🎉 *Вы одобрены!*\n"
-                "Теперь вы можете отправлять контент в свой раздел.\n"
-                "Используйте /content чтобы начать."
-            )
-        elif approved == 0:
-            response += "⏳ Ожидайте решения администратора."
-        else:
-            response += "❌ Вы заблокированы. Обратитесь к администратору."
-            
     else:
         response = (
             "❌ *Вы еще не выбрали раздел.*\n\n"
             "Используйте /start для выбора раздела."
         )
     
-    bot.send_message(message.chat.id, response)
-
-@bot.message_handler(commands=["content", "send"])
-def content_command(message):
-    """Команда для отправки контента одобренными пользователями"""
-    uid = message.from_user.id
-    user_data = db.fetchone(
-        "SELECT section, approved FROM users WHERE user_id = ?",
-        (uid,)
-    )
-    
-    if not user_data:
-        bot.send_message(
-            message.chat.id,
-            "❌ *Сначала выберите раздел!*\n"
-            "Используйте /start для начала работы.",
-            reply_markup=section_kb()
-        )
-        return
-    
-    section_name, approved = user_data
-    
-    if approved != 1:
-        bot.send_message(
-            message.chat.id,
-            f"❌ *Вы не можете отправлять контент.*\n\n"
-            f"📊 Ваш статус: {'⏳ Ожидает модерации' if approved == 0 else '❌ Заблокирован'}\n"
-            f"Дождитесь одобрения администратора."
-        )
-        return
-    
-    # ОДОБРЕННЫЙ пользователь может отправлять контент
-    bot.send_message(
-        message.chat.id,
-        f"📤 *Отправка контента*\n\n"
-        f"📂 *Ваш раздел:* **{section_name}**\n\n"
-        "Теперь вы можете отправлять фото или видео.\n"
-        "Весь контент будет автоматически направлен в ваш раздел.\n\n"
-        "📸 *Просто отправьте фото или видео прямо сейчас.*"
-    )
-    logger.info(f"Одобренный пользователь {uid} запросил отправку контента в раздел {section_name}")
-
-@bot.message_handler(commands=["change", "change_section"])
-def change_section_command(message):
-    """Смена раздела для одобренных пользователей"""
-    uid = message.from_user.id
-    user_data = db.fetchone(
-        "SELECT approved FROM users WHERE user_id = ?",
-        (uid,)
-    )
-    
-    if not user_data:
-        bot.send_message(
-            message.chat.id,
-            "❌ *Сначала выберите раздел!*\n"
-            "Используйте /start для начала работы.",
-            reply_markup=section_kb()
-        )
-        return
-    
-    approved = user_data[0]
-    
-    if approved != 1:
-        bot.send_message(
-            message.chat.id,
-            "❌ *Смена раздела доступна только одобренным пользователям.*\n"
-            "Дождитесь одобрения администратора."
-        )
-        return
-    
-    bot.send_message(
-        message.chat.id,
-        "🔄 *Смена раздела*\n\n"
-        "Выберите новый раздел для отправки контента:",
-        reply_markup=section_kb()
-    )
+    bot.reply_to(message, response)
 
 @bot.message_handler(commands=["reset"])
 def reset_command(message):
-    """Сброс выбранного раздела (только для неодобренных)"""
+    """Сброс выбранного раздела"""
     uid = message.from_user.id
-    user_data = db.fetchone(
-        "SELECT approved FROM users WHERE user_id = ?",
-        (uid,)
-    )
-    
-    if user_data and user_data[0] == 1:
-        bot.send_message(
-            message.chat.id,
-            "❌ *Вы не можете сбросить раздел, так как уже одобрены.*\n"
-            "Используйте /change для смены раздела."
-        )
-        return
-    
     db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
     
     response = (
@@ -386,7 +215,7 @@ def reset_command(message):
     bot.send_message(message.chat.id, response, reply_markup=section_kb())
     logger.info(f"Пользователь {uid} сбросил раздел")
 
-@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("sec_"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
 def section_handler(call):
     """Обработка выбора раздела"""
     try:
@@ -413,178 +242,58 @@ def section_handler(call):
             )
             return
         
-        # Проверяем текущий статус пользователя
-        user_data = db.fetchone(
-            "SELECT approved FROM users WHERE user_id = ?",
-            (uid,)
+        # Сохраняем в БД
+        db.execute(
+            "INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
+            (uid, section_name)
         )
         
-        if user_data and user_data[0] == 1:
-            # Одобренный пользователь меняет раздел
-            db.execute(
-                "UPDATE users SET section = ? WHERE user_id = ?",
-                (section_name, uid)
+        logger.info(f"Пользователь {uid} выбрал раздел: {section_name}")
+        
+        # Обновляем сообщение
+        success_text = (
+            f"✅ *Вы выбрали раздел: {section_name}*\n\n"
+            "📸 *Теперь отправьте фото или видео прямо в этот чат.*\n\n"
+            "_Бот обработает вашу заявку и отправит её на модерацию._"
+        )
+        
+        try:
+            bot.edit_message_text(
+                success_text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None  # Убираем клавиатуру после выбора
             )
-            
-            success_text = (
-                f"✅ *Раздел изменен на: {section_name}*\n\n"
-                "Теперь весь ваш контент будет направляться в этот раздел.\n\n"
-                "📸 *Отправьте фото или видео, чтобы поделиться контентом.*"
+        except Exception as e:
+            # Если не удалось отредактировать сообщение
+            logger.warning(f"Не удалось отредактировать сообщение: {e}")
+            bot.send_message(
+                call.message.chat.id,
+                success_text
             )
-            
-            try:
-                bot.edit_message_text(
-                    success_text,
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    reply_markup=None
-                )
-            except Exception:
-                bot.send_message(call.message.chat.id, success_text)
-            
-            logger.info(f"Одобренный пользователь {uid} сменил раздел на: {section_name}")
-            
-        else:
-            # Новый пользователь или на модерации
-            try:
-                db.execute(
-                    """
-                    INSERT INTO users (user_id, section, approved)
-                    VALUES (?, ?, 0)
-                    ON CONFLICT(user_id) DO UPDATE SET section=excluded.section, approved=0
-                    """,
-                    (uid, section_name)
-                )
-            except Exception as e:
-                logger.debug(f"UPSERT failed or not supported: {e}. Fallback used.")
-                existing = db.fetchone("SELECT 1 FROM users WHERE user_id = ?", (uid,))
-                if existing:
-                    db.execute("UPDATE users SET section = ?, approved = 0 WHERE user_id = ?", (section_name, uid))
-                else:
-                    db.execute("INSERT INTO users (user_id, section, approved) VALUES (?, ?, 0)", (uid, section_name))
-            
-            success_text = (
-                f"✅ *Вы выбрали раздел: {section_name}*\n\n"
-                "📸 *Теперь отправьте фото или видео прямо в этот чат.*\n\n"
-                "_Бот обработает вашу заявку и отправит её на модерацию._"
-            )
-            
-            try:
-                bot.edit_message_text(
-                    success_text,
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    reply_markup=None
-                )
-            except Exception:
-                bot.send_message(call.message.chat.id, success_text)
-            
-            logger.info(f"Пользователь {uid} выбрал раздел: {section_name}")
             
     except Exception as e:
         logger.error(f"Ошибка в section_handler: {e}")
-        try:
-            bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
-        except Exception:
-            pass
-
-@bot.callback_query_handler(func=lambda call: call.data in ["send_content", "change_section", "my_status"])
-def approved_user_actions(call):
-    """Обработка действий одобренных пользователей"""
-    try:
-        uid = call.from_user.id
-        
-        if call.data == "send_content":
-            bot.answer_callback_query(call.id, "Отправьте фото или видео")
-            
-            user_data = db.fetchone(
-                "SELECT section FROM users WHERE user_id = ? AND approved = 1",
-                (uid,)
-            )
-            
-            if user_data:
-                section_name = user_data[0]
-                bot.send_message(
-                    call.message.chat.id,
-                    f"📤 *Отправка контента в раздел: {section_name}*\n\n"
-                    "📸 *Просто отправьте фото или видео прямо сейчас.*\n"
-                    "Оно будет автоматически направлено в ваш раздел."
-                )
-            else:
-                bot.send_message(
-                    call.message.chat.id,
-                    "❌ У вас нет доступа к отправке контента."
-                )
-                
-        elif call.data == "change_section":
-            bot.answer_callback_query(call.id, "Выберите новый раздел")
-            bot.send_message(
-                call.message.chat.id,
-                "🔄 *Смена раздела*\n\n"
-                "Выберите новый раздел для отправки контента:",
-                reply_markup=section_kb()
-            )
-            
-        elif call.data == "my_status":
-            bot.answer_callback_query(call.id, "Проверяем статус...")
-            
-            user_data = db.fetchone(
-                "SELECT section, approved FROM users WHERE user_id = ?",
-                (uid,)
-            )
-            
-            if user_data:
-                section_name, approved = user_data
-                status_text = {
-                    0: "⏳ Ожидает модерации",
-                    1: "✅ Одобрено",
-                    -1: "❌ Заблокирован"
-                }.get(approved, "❓ Неизвестный статус")
-                
-                response = (
-                    f"📊 *Ваш статус:*\n\n"
-                    f"👤 ID: `{uid}`\n"
-                    f"📂 Раздел: {section_name}\n"
-                    f"📈 Статус: {status_text}\n\n"
-                )
-                
-                if approved == 1:
-                    response += "🎉 *Вы одобрены!* Можете отправлять контент."
-                elif approved == 0:
-                    response += "⏳ Ожидайте решения администратора."
-                else:
-                    response += "❌ Вы заблокированы."
-                    
-                bot.send_message(call.message.chat.id, response)
-                
-    except Exception as e:
-        logger.error(f"Ошибка в approved_user_actions: {e}")
-        try:
-            bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-        except Exception:
-            pass
+        bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
 
 @bot.message_handler(content_types=["photo", "video", "animation", "document"])
 def media_handler(message):
-    """Обработка медиафайлов - РАЗНЫЕ СЦЕНАРИИ ДЛЯ РАЗНЫХ СТАТУСОВ"""
+    """Обработка медиафайлов"""
     try:
         uid = message.from_user.id
-        username = message.from_user.username or "нет"
-        first_name = message.from_user.first_name or "не указано"
+        username = message.from_user.username
+        first_name = message.from_user.first_name
         
-        logger.info(f"=== ПОЛУЧЕНО МЕДИА ОТ {uid} ===")
-        logger.info(f"Тип: {message.content_type}, Имя: {first_name}")
-        
-        # Проверяем статус пользователя
+        # Проверяем, выбрал ли пользователь раздел
         user_data = db.fetchone(
             "SELECT section, approved FROM users WHERE user_id = ?",
             (uid,)
         )
         
         if not user_data:
-            # Пользователь без раздела
-            bot.send_message(
-                message.chat.id,
+            # Если раздел не выбран, показываем клавиатуру
+            bot.reply_to(
+                message,
                 "❌ *Сначала выберите раздел!*\n\n"
                 "Нажмите на кнопку ниже:",
                 reply_markup=section_kb()
@@ -593,108 +302,64 @@ def media_handler(message):
         
         section_name, approved = user_data
         
+        # Проверяем, не забанен ли пользователь
         if approved == -1:
-            # Заблокированный пользователь
-            bot.send_message(
-                message.chat.id, 
+            bot.reply_to(
+                message, 
                 "❌ *Вы заблокированы и не можете отправлять контент.*\n\n"
                 "Обратитесь к администратору для разблокировки."
             )
             return
         
-        elif approved == 0:
-            # Пользователь на модерации - отправляем админам на проверку
-            logger.info(f"Медиа от пользователя на модерации {uid}, раздел: {section_name}")
-            
-            # Отправляем админам на модерацию
-            submission_time = datetime.now().strftime("%H:%M:%S")
-            
-            for admin_id in ADMIN_IDS:
-                try:
-                    caption = (
-                        f"📨 *Новая анкета на модерацию*\n\n"
-                        f"👤 *Пользователь:*\n"
-                        f"ID: `{uid}`\n"
-                        f"Имя: {first_name}\n"
-                        f"Ник: @{username}\n\n"
-                        f"📂 *Раздел:* {section_name}\n"
-                        f"🕒 *Время:* {submission_time}\n\n"
-                        f"📎 *Тип:* {message.content_type}"
-                    )
-                    
-                    if message.content_type == 'photo':
-                        file_id = message.photo[-1].file_id
-                        bot.send_photo(
-                            admin_id,
-                            file_id,
-                            caption=caption,
-                            reply_markup=mod_kb(uid)
-                        )
-                    elif message.content_type == 'video':
-                        file_id = message.video.file_id
-                        bot.send_video(
-                            admin_id,
-                            file_id,
-                            caption=caption,
-                            reply_markup=mod_kb(uid)
-                        )
-                    else:
-                        bot.forward_message(admin_id, message.chat.id, message.message_id)
-                        bot.send_message(
-                            admin_id,
-                            f"{caption}\n\n📋 *Модерация:*",
-                            reply_markup=mod_kb(uid)
-                        )
-                    
-                    logger.info(f"✅ Анкета на модерацию отправлена админу {admin_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Не удалось отправить админу {admin_id}: {e}")
-            
-            # Подтверждение пользователю
-            bot.send_message(
-                message.chat.id,
-                "✅ *Ваша анкета отправлена на модерацию!*\n\n"
-                "⏳ *Ожидайте решения администратора.*\n\n"
-                "_Вы получите уведомление о результате._"
-            )
-            
-        elif approved == 1:
-            # ОДОБРЕННЫЙ пользователь отправляет контент
-            logger.info(f"Контент от одобренного пользователя {uid}, раздел: {section_name}")
-            
-            # Здесь должна быть логика отправки контента в группу/канал
-            # Пока просто уведомляем пользователя
-            bot.send_message(
-                message.chat.id,
-                f"✅ *Контент принят!*\n\n"
-                f"📂 *Раздел:* **{section_name}**\n\n"
-                "Ваш контент будет доступен в соответствующем разделе.\n"
-                "Спасибо за участие! 🎉"
-            )
-            
-        logger.info(f"✅ Обработка медиа завершена для пользователя {uid}")
+        logger.info(f"Медиа от пользователя {uid}, раздел: {section_name}")
+        
+        # Отправляем админам
+        submission_time = datetime.now().strftime("%H:%M:%S")
+        for admin_id in ADMIN_IDS:
+            try:
+                # Отправляем информацию о пользователе
+                user_info = (
+                    f"📨 *Новая анкета на модерацию*\n\n"
+                    f"👤 *Пользователь:*\n"
+                    f"ID: `{uid}`\n"
+                    f"Имя: {first_name}\n"
+                    f"Ник: @{username if username else 'нет'}\n\n"
+                    f"📂 *Раздел:* {section_name}\n"
+                    f"🕒 *Время:* {submission_time}\n\n"
+                    f"📎 *Тип:* {message.content_type}"
+                )
+                
+                bot.send_message(admin_id, user_info)
+                
+                # Пересылаем медиа
+                bot.forward_message(admin_id, message.chat.id, message.message_id)
+                
+                # Клавиатура модерации
+                bot.send_message(admin_id, "📋 *Модерация:*", reply_markup=mod_kb(uid))
+                
+                logger.info(f"Уведомление отправлено админу {admin_id}")
+                
+            except Exception as e:
+                logger.error(f"Не удалось отправить админу {admin_id}: {e}")
+        
+        # Подтверждение пользователю
+        bot.reply_to(
+            message,
+            "✅ *Ваша анкета отправлена на модерацию!*\n\n"
+            "⏳ *Ожидайте решения администратора.*\n\n"
+            "_Вы получите уведомление о результате._"
+        )
         
     except Exception as e:
-        logger.error(f"❌ Ошибка в media_handler: {e}")
-        try:
-            bot.send_message(
-                message.chat.id,
-                "❌ Произошла ошибка при обработке медиа. Пожалуйста, попробуйте еще раз."
-            )
-        except Exception as send_error:
-            logger.error(f"Не удалось отправить сообщение об ошибке: {send_error}")
+        logger.error(f"Ошибка в media_handler: {e}")
+        bot.reply_to(message, "❌ Произошла ошибка при обработке медиа")
 
-@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith(("app_", "rej_")))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_")))
 def moderation_handler(call):
     """Обработка модерации"""
     try:
-        logger.info(f"=== НАЧАЛО МОДЕРАЦИИ ===")
-        logger.info(f"Callback от: {call.from_user.id}, data: {call.data}")
-        
         # Проверяем права администратора
         if call.from_user.id not in ADMIN_IDS:
-            logger.warning(f"Попытка модерации от не-админа: {call.from_user.id}")
             bot.answer_callback_query(call.id, "❌ У вас нет прав!", show_alert=True)
             return
         
@@ -703,17 +368,10 @@ def moderation_handler(call):
         # Разбираем callback data
         parts = call.data.split("_")
         if len(parts) != 2:
-            logger.error(f"Неверный формат callback: {call.data}")
             return
         
         action, uid_str = parts
-        try:
-            uid = int(uid_str)
-        except ValueError:
-            logger.error(f"Неверный uid в callback: {uid_str}")
-            return
-        
-        logger.info(f"Действие: {action}, Пользователь: {uid}")
+        uid = int(uid_str)
         
         # Получаем информацию о пользователе
         user_data = db.fetchone(
@@ -732,16 +390,10 @@ def moderation_handler(call):
             status_text = "✅ Одобрена"
             user_message = (
                 "🎉 *Ваша анкета одобрена!*\n\n"
-                "✅ *Статус:* **Одобрено администратором**\n"
-                f"📂 *Раздел:* **{section_name}**\n\n"
-                "*🎊 Поздравляем! Теперь вы можете:*\n"
-                "• 📤 Отправлять контент в свой раздел\n"
-                "• 🔄 Сменить раздел если нужно\n"
-                "• 📊 Проверять свой статус\n\n"
-                "_Используйте /start чтобы увидеть новые возможности!_"
+                "✅ *Статус:* Одобрено администратором\n"
+                f"📂 *Раздел:* {section_name}\n\n"
+                "Теперь ваш контент будет доступен другим пользователям."
             )
-            logger.info(f"✅ Анкета {uid} одобрена")
-            
         else:  # rej
             db.execute(
                 "UPDATE users SET approved = -1 WHERE user_id = ?",
@@ -752,90 +404,71 @@ def moderation_handler(call):
                 "❌ *Ваша анкета отклонена.*\n\n"
                 "🔄 Вы можете отправить новый контент, но сначала выберите раздел: /start"
             )
-            logger.info(f"❌ Анкета {uid} отклонена")
         
         # Отправляем решение пользователю
         try:
             bot.send_message(uid, user_message)
-            logger.info(f"✅ Решение отправлено пользователю {uid}")
+            logger.info(f"Решение отправлено пользователю {uid}: {action}")
         except apihelper.ApiTelegramException as e:
-            try:
-                if e.error_code == 403:
-                    logger.warning(f"Пользователь {uid} заблокировал бота")
-                else:
-                    logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
-            except Exception:
-                logger.error(f"Ошибка при обработке ApiTelegramException: {e}")
+            if e.error_code == 403:
+                logger.warning(f"Пользователь {uid} заблокировал бота")
+            else:
+                logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
         
-        # Отправляем админу подтверждение
+        # Обновляем сообщение админу
         try:
-            bot.send_message(
-                call.from_user.id,
-                f"📋 *Модерация завершена*\n\n"
-                f"👤 *Пользователь:* `{uid}`\n"
-                f"📂 *Раздел:* {section_name}\n"
-                f"📊 *Решение:* {status_text}\n"
-                f"👨‍💼 *Модератор:* {call.from_user.first_name}\n\n"
-                f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}"
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    f"📋 *Модерация завершена*\n\n"
+                    f"👤 *Пользователь:* `{uid}`\n"
+                    f"📂 *Раздел:* {section_name}\n"
+                    f"📊 *Решение:* {status_text}\n"
+                    f"👨‍💼 *Модератор:* {call.from_user.first_name}\n\n"
+                    f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}"
+                )
             )
-            logger.info(f"✅ Уведомление админу отправлено")
         except Exception as e:
-            logger.error(f"Не удалось отправить уведомление админу: {e}")
+            logger.warning(f"Не удалось отредактировать сообщение: {e}")
         
-        logger.info(f"=== МОДЕРАЦИЯ ЗАВЕРШЕНА ===")
+        logger.info(f"Модерация: {action} для пользователя {uid}, раздел: {section_name}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка в moderation_handler: {e}")
-        try:
-            bot.answer_callback_query(call.id, "❌ Ошибка!", show_alert=True)
-        except Exception:
-            pass
+        logger.error(f"Ошибка в moderation_handler: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка!", show_alert=True)
 
 @bot.message_handler(func=lambda message: True)
 def other_messages(message):
     """Обработка всех остальных сообщений"""
     if message.text and message.text.startswith('/'):
-        bot.send_message(
-            message.chat.id,
+        bot.reply_to(
+            message,
             "❌ *Неизвестная команда.*\n\n"
             "Доступные команды:\n"
             "/start - Начать работу с ботом\n"
             "/status - Проверить статус\n"
-            "/content - Отправить контент (для одобренных)\n"
-            "/change - Сменить раздел (для одобренных)\n"
-            "/reset - Сбросить раздел (для новых)\n"
+            "/reset - Сбросить раздел\n"
             "/help - Помощь"
         )
     elif message.text:
-        # Если текст не команда
+        # Если текст не команда, проверяем статус пользователя
         uid = message.from_user.id
         user_data = db.fetchone(
-            "SELECT section, approved FROM users WHERE user_id = ?",
+            "SELECT section FROM users WHERE user_id = ?",
             (uid,)
         )
         
         if user_data:
-            section_name, approved = user_data
-            if approved == 1:
-                bot.send_message(
-                    message.chat.id,
-                    f"📤 *Отправьте фото или видео для раздела {section_name}*\n\n"
-                    "Или используйте команды:\n"
-                    "/content - Отправить контент\n"
-                    "/change - Сменить раздел\n"
-                    "/status - Проверить статус"
-                )
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    "📸 *Отправьте фото или видео для модерации.*\n\n"
-                    f"Ваш текущий раздел: {section_name}\n"
-                    f"Статус: {'⏳ На модерации' if approved == 0 else '❌ Заблокирован'}\n\n"
-                    "Изменить раздел: /start"
-                )
+            bot.reply_to(
+                message,
+                "📸 *Отправьте фото или видео для модерации.*\n\n"
+                f"Ваш текущий раздел: {user_data[0]}\n\n"
+                "Изменить раздел: /start"
+            )
         else:
-            bot.send_message(
-                message.chat.id,
+            bot.reply_to(
+                message,
                 "👋 *Сначала выберите раздел!*\n\n"
                 "Используйте /start для начала работы.",
                 reply_markup=section_kb()
@@ -870,14 +503,10 @@ def health():
 def stats():
     """Статистика бота (только для админов)"""
     try:
-        total_row = db.fetchone("SELECT COUNT(*) FROM users")
-        total_users = total_row[0] if total_row else 0
-        pending_row = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 0")
-        pending = pending_row[0] if pending_row else 0
-        approved_row = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 1")
-        approved = approved_row[0] if approved_row else 0
-        rejected_row = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = -1")
-        rejected = rejected_row[0] if rejected_row else 0
+        total_users = db.fetchone("SELECT COUNT(*) FROM users")[0]
+        pending = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 0")[0]
+        approved = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 1")[0]
+        rejected = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = -1")[0]
         
         return {
             "total_users": total_users,
@@ -890,12 +519,12 @@ def stats():
         return {"error": str(e)}, 500
 
 def run_flask():
-    """Запуск Flask (в отдельном потоке вызывается)"""
+    """Запуск Flask в отдельном потоке"""
     # Отключаем логирование Flask
     import logging as flask_logging
     flask_logging.getLogger('werkzeug').setLevel(flask_logging.WARNING)
     
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", 10000))  # Render использует порт 10000
     logger.info(f"Запуск Flask сервера на порту {port}")
     
     app.run(
@@ -906,8 +535,50 @@ def run_flask():
         threaded=True
     )
 
-def check_bot_api(max_attempts=3):
-    """Проверка доступности Telegram API перед запуском"""
-    for attempt in range(max_attempts):
-        try:
-            bot_info = bot.get_me()
+def signal_handler(signum, frame):
+    """Обработка сигналов завершения"""
+    logger.info(f"Получен сигнал {signum}. Завершение работы...")
+    sys.exit(0)
+
+# --- Запуск ---
+if __name__ == '__main__':
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    logger.info("=" * 50)
+    logger.info("🚀 Запуск Telegram бота")
+    
+    try:
+        bot_info = bot.get_me()
+        logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
+    except Exception as e:
+        logger.error(f"Не удалось получить информацию о боте: {e}")
+        logger.error("Проверьте:")
+        logger.error("1. Правильность токена на Render")
+        logger.error("2. Что токен активен (не ревокнут)")
+        logger.error("3. Сетевое соединение")
+        sys.exit(1)
+    
+    logger.info(f"👨‍💼 Админы: {ADMIN_IDS}")
+    logger.info("=" * 50)
+    
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Запускаем бота
+    try:
+        logger.info("🔄 Начинаем polling...")
+        bot.infinity_polling(
+            timeout=60,
+            long_polling_timeout=30,
+            logger_level=logging.WARNING
+        )
+    except KeyboardInterrupt:
+        logger.info("⏹ Остановка по запросу пользователя...")
+    except Exception as e:
+        logger.error(f"Критическая ошибка бота: {e}")
+        sys.exit(1)
+    finally:
+        logger.info("🤖 Бот остановлен")
