@@ -9,6 +9,7 @@ from flask import Flask
 import signal
 import sys
 from datetime import datetime
+import time  # Важно добавить!
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -887,18 +888,16 @@ if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("🚀 Запуск Telegram бота")
     
-    try:
-        bot_info = bot.get_me()
-        logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
-        logger.info(f"👥 Админы: {ADMIN_IDS}")
-    except Exception as e:
-        logger.error(f"Не удалось получить информацию о боте: {e}")
-        logger.error("Проверьте:")
-        logger.error("1. Правильность токена на Render")
-        logger.error("2. Что токен активен (не ревокнут)")
-        logger.error("3. Сетевое соединение")
-        sys.exit(1)
-    
-    logger.info("=" * 50)
-    
-    # Запускаем Flask в отдельном
+    # Проверяем соединение с Telegram API
+    for check_attempt in range(3):
+        try:
+            bot_info = bot.get_me()
+            logger.info(f"✅ Проверка API: успешно")
+            logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
+            logger.info(f"👥 Админы: {ADMIN_IDS}")
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
+            if check_attempt < 2:
+                time.sleep(5)
+            else
