@@ -10,6 +10,7 @@ import signal
 import sys
 from datetime import datetime
 import time
+import multiprocessing
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -874,28 +875,22 @@ def run_flask():
         threaded=True
     )
 
-def signal_handler(signum, frame):
-    """Обработка сигналов завершения"""
-    logger.info(f"Получен сигнал {signum}. Завершение работы...")
-    sys.exit(0)
-
-# --- Запуск ---
-if __name__ == '__main__':
-    # Регистрируем обработчики сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    logger.info("=" * 50)
-    logger.info("🚀 Запуск Telegram бота")
-    
-    # Проверяем соединение с Telegram API
-    for check_attempt in range(3):
-        try:
-            bot_info = bot.get_me()
-            logger.info(f"✅ Проверка API: успешно")
-            logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
-            logger.info(f"👥 Админы: {ADMIN_IDS}")
-            break
-        except Exception as e:
-            logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
-
+def run_bot():
+    """Запуск бота с обработкой исключений"""
+    try:
+        logger.info("=" * 50)
+        logger.info("🚀 Запуск Telegram бота")
+        
+        # Проверяем соединение с Telegram API
+        for check_attempt in range(3):
+            try:
+                bot_info = bot.get_me()
+                logger.info(f"✅ Проверка API: успешно")
+                logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
+                logger.info(f"👥 Админы: {ADMIN_IDS}")
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
+                time.sleep(2)
+        
+       
