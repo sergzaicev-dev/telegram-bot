@@ -897,4 +897,5 @@ if __name__ == '__main__':
             logger.info(f"👥 Админы: {ADMIN_IDS}")
             break
         except Exception as e:
-            logger.warning(f"⚠️ Проверка API не удалась (попытка {
+            logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
+
