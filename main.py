@@ -41,8 +41,8 @@ BOT_TOKEN = BOT_TOKEN.strip()
 
 # Проверяем формат токена
 if ':' not in BOT_TOKEN:
-    logger.error(f"❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
-    logger.error(f"Токен должен содержать двоеточие: 1234567890:ABCdefGHI...")
+    logger.error("❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
+    logger.error("Токен должен содержать двоеточие: 1234567890:ABCdefGHI...")
     logger.error(f"Ваш токен: '{BOT_TOKEN}'")
     sys.exit(1)
 
@@ -59,10 +59,14 @@ class DatabaseManager:
         self.lock = threading.Lock()
         self._init_db()
     
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        return conn
+
     def _init_db(self):
         """Инициализация базы данных"""
         with self.lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -78,12 +82,16 @@ class DatabaseManager:
     def execute(self, query, params=()):
         """Безопасное выполнение запроса"""
         with self.lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = self._get_conn()
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
                 conn.commit()
-                result = cursor.lastrowid
+                sql_type = query.strip().split()[0].upper()
+                if sql_type == "INSERT":
+                    result = cursor.lastrowid
+                else:
+                    result = cursor.rowcount
             except Exception as e:
                 logger.error(f"Ошибка БД: {e}")
                 result = None
@@ -94,7 +102,7 @@ class DatabaseManager:
     def fetchone(self, query, params=()):
         """Безопасное получение одной записи"""
         with self.lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = self._get_conn()
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
@@ -109,7 +117,7 @@ class DatabaseManager:
     def fetchall(self, query, params=()):
         """Безопасное получение всех записей"""
         with self.lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = self._get_conn()
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
@@ -378,7 +386,7 @@ def reset_command(message):
     bot.send_message(message.chat.id, response, reply_markup=section_kb())
     logger.info(f"Пользователь {uid} сбросил раздел")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("sec_"))
 def section_handler(call):
     """Обработка выбора раздела"""
     try:
@@ -431,17 +439,29 @@ def section_handler(call):
                     message_id=call.message.message_id,
                     reply_markup=None
                 )
-            except:
+            except Exception:
                 bot.send_message(call.message.chat.id, success_text)
             
             logger.info(f"Одобренный пользователь {uid} сменил раздел на: {section_name}")
             
         else:
             # Новый пользователь или на модерации
-            db.execute(
-                "INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
-                (uid, section_name)
-            )
+            try:
+                db.execute(
+                    """
+                    INSERT INTO users (user_id, section, approved)
+                    VALUES (?, ?, 0)
+                    ON CONFLICT(user_id) DO UPDATE SET section=excluded.section, approved=0
+                    """,
+                    (uid, section_name)
+                )
+            except Exception as e:
+                logger.debug(f"UPSERT failed or not supported: {e}. Fallback used.")
+                existing = db.fetchone("SELECT 1 FROM users WHERE user_id = ?", (uid,))
+                if existing:
+                    db.execute("UPDATE users SET section = ?, approved = 0 WHERE user_id = ?", (section_name, uid))
+                else:
+                    db.execute("INSERT INTO users (user_id, section, approved) VALUES (?, ?, 0)", (uid, section_name))
             
             success_text = (
                 f"✅ *Вы выбрали раздел: {section_name}*\n\n"
@@ -456,14 +476,17 @@ def section_handler(call):
                     message_id=call.message.message_id,
                     reply_markup=None
                 )
-            except:
+            except Exception:
                 bot.send_message(call.message.chat.id, success_text)
             
             logger.info(f"Пользователь {uid} выбрал раздел: {section_name}")
             
     except Exception as e:
         logger.error(f"Ошибка в section_handler: {e}")
-        bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
+        try:
+            bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
+        except Exception:
+            pass
 
 @bot.callback_query_handler(func=lambda call: call.data in ["send_content", "change_section", "my_status"])
 def approved_user_actions(call):
@@ -536,7 +559,10 @@ def approved_user_actions(call):
                 
     except Exception as e:
         logger.error(f"Ошибка в approved_user_actions: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
+        try:
+            bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
+        except Exception:
+            pass
 
 @bot.message_handler(content_types=["photo", "video", "animation", "document"])
 def media_handler(message):
@@ -602,7 +628,6 @@ def media_handler(message):
                             admin_id,
                             file_id,
                             caption=caption,
-                            parse_mode="Markdown",
                             reply_markup=mod_kb(uid)
                         )
                     elif message.content_type == 'video':
@@ -611,7 +636,6 @@ def media_handler(message):
                             admin_id,
                             file_id,
                             caption=caption,
-                            parse_mode="Markdown",
                             reply_markup=mod_kb(uid)
                         )
                     else:
@@ -619,7 +643,6 @@ def media_handler(message):
                         bot.send_message(
                             admin_id,
                             f"{caption}\n\n📋 *Модерация:*",
-                            parse_mode="Markdown",
                             reply_markup=mod_kb(uid)
                         )
                     
@@ -650,10 +673,6 @@ def media_handler(message):
                 "Спасибо за участие! 🎉"
             )
             
-            # TODO: Добавить отправку в группу/канал
-            # bot.send_message(GROUP_ID, f"Новый контент в разделе {section_name} от @{username}")
-            # bot.forward_message(GROUP_ID, message.chat.id, message.message_id)
-            
         logger.info(f"✅ Обработка медиа завершена для пользователя {uid}")
         
     except Exception as e:
@@ -666,7 +685,7 @@ def media_handler(message):
         except Exception as send_error:
             logger.error(f"Не удалось отправить сообщение об ошибке: {send_error}")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_")))
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith(("app_", "rej_")))
 def moderation_handler(call):
     """Обработка модерации"""
     try:
@@ -688,7 +707,11 @@ def moderation_handler(call):
             return
         
         action, uid_str = parts
-        uid = int(uid_str)
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            logger.error(f"Неверный uid в callback: {uid_str}")
+            return
         
         logger.info(f"Действие: {action}, Пользователь: {uid}")
         
@@ -733,13 +756,16 @@ def moderation_handler(call):
         
         # Отправляем решение пользователю
         try:
-            bot.send_message(uid, user_message, parse_mode="Markdown")
+            bot.send_message(uid, user_message)
             logger.info(f"✅ Решение отправлено пользователю {uid}")
         except apihelper.ApiTelegramException as e:
-            if e.error_code == 403:
-                logger.warning(f"Пользователь {uid} заблокировал бота")
-            else:
-                logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
+            try:
+                if e.error_code == 403:
+                    logger.warning(f"Пользователь {uid} заблокировал бота")
+                else:
+                    logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
+            except Exception:
+                logger.error(f"Ошибка при обработке ApiTelegramException: {e}")
         
         # Отправляем админу подтверждение
         try:
@@ -750,8 +776,7 @@ def moderation_handler(call):
                 f"📂 *Раздел:* {section_name}\n"
                 f"📊 *Решение:* {status_text}\n"
                 f"👨‍💼 *Модератор:* {call.from_user.first_name}\n\n"
-                f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}",
-                parse_mode="Markdown"
+                f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}"
             )
             logger.info(f"✅ Уведомление админу отправлено")
         except Exception as e:
@@ -761,7 +786,10 @@ def moderation_handler(call):
         
     except Exception as e:
         logger.error(f"❌ Ошибка в moderation_handler: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка!", show_alert=True)
+        try:
+            bot.answer_callback_query(call.id, "❌ Ошибка!", show_alert=True)
+        except Exception:
+            pass
 
 @bot.message_handler(func=lambda message: True)
 def other_messages(message):
@@ -842,10 +870,14 @@ def health():
 def stats():
     """Статистика бота (только для админов)"""
     try:
-        total_users = db.fetchone("SELECT COUNT(*) FROM users")[0]
-        pending = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 0")[0]
-        approved = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 1")[0]
-        rejected = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = -1")[0]
+        total_row = db.fetchone("SELECT COUNT(*) FROM users")
+        total_users = total_row[0] if total_row else 0
+        pending_row = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 0")
+        pending = pending_row[0] if pending_row else 0
+        approved_row = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 1")
+        approved = approved_row[0] if approved_row else 0
+        rejected_row = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = -1")
+        rejected = rejected_row[0] if rejected_row else 0
         
         return {
             "total_users": total_users,
@@ -858,12 +890,12 @@ def stats():
         return {"error": str(e)}, 500
 
 def run_flask():
-    """Запуск Flask в отдельном потоке"""
+    """Запуск Flask (в отдельном потоке вызывается)"""
     # Отключаем логирование Flask
     import logging as flask_logging
     flask_logging.getLogger('werkzeug').setLevel(flask_logging.WARNING)
     
-    port = int(os.getenv("PORT", 10000))  # Render использует порт 10000
+    port = int(os.getenv("PORT", "10000"))
     logger.info(f"Запуск Flask сервера на порту {port}")
     
     app.run(
@@ -874,27 +906,8 @@ def run_flask():
         threaded=True
     )
 
-def run_bot():
-    """Запуск бота с обработкой исключений"""
-    try:
-        logger.info("=" * 50)
-        logger.info("🚀 Запуск Telegram бота")
-        
-        # Проверяем соединение с Telegram API
-        for check_attempt in range(3):
-            try:
-                bot_info = bot.get_me()
-                logger.info(f"✅ Проверка API: успешно")
-                logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
-                logger.info(f"👥 Админы: {ADMIN_IDS}")
-                break
-            except Exception as e:
-                logger.warning(f"⚠️ Проверка API не удалась (попытка {check_attempt + 1}): {e}")
-                time.sleep(2)
-        
-        # Запускаем опрос обновлений
-        logger.info("🔄 Начинаю опрос обновлений...")
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка при запуске бота: {
+def check_bot_api(max_attempts=3):
+    """Проверка доступности Telegram API перед запуском"""
+    for attempt in range(max_attempts):
+        try:
+            bot_info = bot.get_me()
