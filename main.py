@@ -273,7 +273,7 @@ def status_command(message):
             "Используйте /start для выбора раздела."
         )
     
-    bot.reply_to(message, response)
+    bot.send_message(message.chat.id, response)
 
 @bot.message_handler(commands=["content", "send"])
 def content_command(message):
@@ -285,8 +285,8 @@ def content_command(message):
     )
     
     if not user_data:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            message.chat.id,
             "❌ *Сначала выберите раздел!*\n"
             "Используйте /start для начала работы.",
             reply_markup=section_kb()
@@ -296,8 +296,8 @@ def content_command(message):
     section_name, approved = user_data
     
     if approved != 1:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            message.chat.id,
             f"❌ *Вы не можете отправлять контент.*\n\n"
             f"📊 Ваш статус: {'⏳ Ожидает модерации' if approved == 0 else '❌ Заблокирован'}\n"
             f"Дождитесь одобрения администратора."
@@ -305,8 +305,8 @@ def content_command(message):
         return
     
     # ОДОБРЕННЫЙ пользователь может отправлять контент
-    bot.reply_to(
-        message,
+    bot.send_message(
+        message.chat.id,
         f"📤 *Отправка контента*\n\n"
         f"📂 *Ваш раздел:* **{section_name}**\n\n"
         "Теперь вы можете отправлять фото или видео.\n"
@@ -325,8 +325,8 @@ def change_section_command(message):
     )
     
     if not user_data:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            message.chat.id,
             "❌ *Сначала выберите раздел!*\n"
             "Используйте /start для начала работы.",
             reply_markup=section_kb()
@@ -336,8 +336,8 @@ def change_section_command(message):
     approved = user_data[0]
     
     if approved != 1:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            message.chat.id,
             "❌ *Смена раздела доступна только одобренным пользователям.*\n"
             "Дождитесь одобрения администратора."
         )
@@ -360,8 +360,8 @@ def reset_command(message):
     )
     
     if user_data and user_data[0] == 1:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            message.chat.id,
             "❌ *Вы не можете сбросить раздел, так как уже одобрены.*\n"
             "Используйте /change для смены раздела."
         )
@@ -556,8 +556,8 @@ def media_handler(message):
         
         if not user_data:
             # Пользователь без раздела
-            bot.reply_to(
-                message,
+            bot.send_message(
+                message.chat.id,
                 "❌ *Сначала выберите раздел!*\n\n"
                 "Нажмите на кнопку ниже:",
                 reply_markup=section_kb()
@@ -568,8 +568,8 @@ def media_handler(message):
         
         if approved == -1:
             # Заблокированный пользователь
-            bot.reply_to(
-                message, 
+            bot.send_message(
+                message.chat.id, 
                 "❌ *Вы заблокированы и не можете отправлять контент.*\n\n"
                 "Обратитесь к администратору для разблокировки."
             )
@@ -628,8 +628,8 @@ def media_handler(message):
                     logger.error(f"Не удалось отправить админу {admin_id}: {e}")
             
             # Подтверждение пользователю
-            bot.reply_to(
-                message,
+            bot.send_message(
+                message.chat.id,
                 "✅ *Ваша анкета отправлена на модерацию!*\n\n"
                 "⏳ *Ожидайте решения администратора.*\n\n"
                 "_Вы получите уведомление о результате._"
@@ -641,8 +641,8 @@ def media_handler(message):
             
             # Здесь должна быть логика отправки контента в группу/канал
             # Пока просто уведомляем пользователя
-            bot.reply_to(
-                message,
+            bot.send_message(
+                message.chat.id,
                 f"✅ *Контент принят!*\n\n"
                 f"📂 *Раздел:* **{section_name}**\n\n"
                 "Ваш контент будет доступен в соответствующем разделе.\n"
@@ -657,11 +657,17 @@ def media_handler(message):
         
     except Exception as e:
         logger.error(f"❌ Ошибка в media_handler: {e}")
-        bot.reply_to(message, "❌ Произошла ошибка при обработке медиа")
+        try:
+            bot.send_message(
+                message.chat.id,
+                "❌ Произошла ошибка при обработке медиа. Пожалуйста, попробуйте еще раз."
+            )
+        except Exception as send_error:
+            logger.error(f"Не удалось отправить сообщение об ошибке: {send_error}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_")))
 def moderation_handler(call):
-    """Обработка модерации - ИСПРАВЛЕННАЯ"""
+    """Обработка модерации"""
     try:
         logger.info(f"=== НАЧАЛО МОДЕРАЦИИ ===")
         logger.info(f"Callback от: {call.from_user.id}, data: {call.data}")
@@ -734,7 +740,7 @@ def moderation_handler(call):
             else:
                 logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
         
-        # Отправляем админу подтверждение (новое сообщение вместо редактирования)
+        # Отправляем админу подтверждение
         try:
             bot.send_message(
                 call.from_user.id,
@@ -760,8 +766,8 @@ def moderation_handler(call):
 def other_messages(message):
     """Обработка всех остальных сообщений"""
     if message.text and message.text.startswith('/'):
-        bot.reply_to(
-            message,
+        bot.send_message(
+            message.chat.id,
             "❌ *Неизвестная команда.*\n\n"
             "Доступные команды:\n"
             "/start - Начать работу с ботом\n"
@@ -782,8 +788,8 @@ def other_messages(message):
         if user_data:
             section_name, approved = user_data
             if approved == 1:
-                bot.reply_to(
-                    message,
+                bot.send_message(
+                    message.chat.id,
                     f"📤 *Отправьте фото или видео для раздела {section_name}*\n\n"
                     "Или используйте команды:\n"
                     "/content - Отправить контент\n"
@@ -791,16 +797,16 @@ def other_messages(message):
                     "/status - Проверить статус"
                 )
             else:
-                bot.reply_to(
-                    message,
+                bot.send_message(
+                    message.chat.id,
                     "📸 *Отправьте фото или видео для модерации.*\n\n"
                     f"Ваш текущий раздел: {section_name}\n"
                     f"Статус: {'⏳ На модерации' if approved == 0 else '❌ Заблокирован'}\n\n"
                     "Изменить раздел: /start"
                 )
         else:
-            bot.reply_to(
-                message,
+            bot.send_message(
+                message.chat.id,
                 "👋 *Сначала выберите раздел!*\n\n"
                 "Используйте /start для начала работы.",
                 reply_markup=section_kb()
@@ -890,4 +896,9 @@ if __name__ == '__main__':
         logger.error("Проверьте:")
         logger.error("1. Правильность токена на Render")
         logger.error("2. Что токен активен (не ревокнут)")
-        logger.error
+        logger.error("3. Сетевое соединение")
+        sys.exit(1)
+    
+    logger.info("=" * 50)
+    
+    # Запускаем Flask в отдельном
