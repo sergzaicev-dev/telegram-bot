@@ -1,88 +1,85 @@
 import os
 import telebot
-from telebot import apihelper
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot import types
 import sqlite3
 import threading
 import logging
-from flask import Flask
-import signal
-import sys
 from datetime import datetime
+import time
 
-# --- Настройка логирования ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# ========== НАСТРОЙКА ==========
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- НАСТРОЙКИ ---
-# Получаем токен ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+if not ADMIN_IDS:
+    ADMIN_IDS = [5064426902]  # Fallback
 
-# Если токен не найден - критическая ошибка
-if not BOT_TOKEN:
-    logger.error("❌ ОШИБКА: BOT_TOKEN не задан в переменных окружения.")
-    logger.info("📝 Как настроить на Render:")
-    logger.info("1. Dashboard → ваш_сервис → Environment")
-    logger.info("2. Add Environment Variable")
-    logger.info("3. Key: BOT_TOKEN")
-    logger.info("4. Value: ваш_токен_из_BotFather")
-    logger.info("5. Сохранить и перезапустить сервис")
-    sys.exit(1)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Убираем пробелы по краям (если есть)
-BOT_TOKEN = BOT_TOKEN.strip()
-
-# Проверяем формат токена
-if ':' not in BOT_TOKEN:
-    logger.error(f"❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
-    logger.error(f"Токен должен содержать двоеточие: 1234567890:ABCdefGHI...")
-    logger.error(f"Ваш токен: '{BOT_TOKEN}'")
-    sys.exit(1)
-
-ADMIN_IDS = [5064426902]  # Замените на ваш ID
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
-
-logger.info(f"✅ Бот инициализирован. ID: {BOT_TOKEN.split(':')[0]}")
-# --- КОНЕЦ НАСТРОЕК ---
-
-# --- Потокобезопасная работа с базой данных ---
-class DatabaseManager:
-    def __init__(self, db_path='users.db'):
+# ========== БАЗА ДАННЫХ ==========
+class Database:
+    def __init__(self, db_path='bot.db'):
         self.db_path = db_path
         self.lock = threading.Lock()
-        self._init_db()
+        self.init_db()
     
-    def _init_db(self):
-        """Инициализация базы данных"""
+    def init_db(self):
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
-            cursor.execute("""
+            
+            # Пользователи
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
-                    section TEXT,
-                    approved INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    username TEXT,
+                    first_name TEXT,
+                    status TEXT DEFAULT 'pending',  # pending, approved, rejected, banned
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+            ''')
+            
+            # Анкеты
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS applications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    section TEXT NOT NULL,
+                    status TEXT DEFAULT 'pending',  # pending, approved, rejected
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    moderated_at TIMESTAMP,
+                    moderator_id INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            ''')
+            
+            # Фото анкет
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS application_photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id INTEGER NOT NULL,
+                    photo_type TEXT NOT NULL,  # normal, intimate
+                    file_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
+                )
+            ''')
+            
             conn.commit()
             conn.close()
+        logger.info("База данных инициализирована")
     
-    def execute(self, query, params=()):
-        """Безопасное выполнение запроса"""
+    def execute(self, query, params=(), return_id=False):
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
                 conn.commit()
-                result = cursor.lastrowid
+                result = cursor.lastrowid if return_id else cursor.rowcount
             except Exception as e:
                 logger.error(f"Ошибка БД: {e}")
                 result = None
@@ -91,329 +88,455 @@ class DatabaseManager:
             return result
     
     def fetchone(self, query, params=()):
-        """Безопасное получение одной записи"""
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
-                result = cursor.fetchone()
+                row = cursor.fetchone()
+                return dict(row) if row else None
             except Exception as e:
-                logger.error(f"Ошибка БД: {e}")
-                result = None
+                logger.error(f"Ошибка fetchone: {e}")
+                return None
             finally:
                 conn.close()
-            return result
     
     def fetchall(self, query, params=()):
-        """Безопасное получение всех записей"""
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
-                result = cursor.fetchall()
+                return [dict(row) for row in cursor.fetchall()]
             except Exception as e:
-                logger.error(f"Ошибка БД: {e}")
-                result = []
+                logger.error(f"Ошибка fetchall: {e}")
+                return []
             finally:
                 conn.close()
-            return result
 
-# Инициализация менеджера БД
-db = DatabaseManager()
+db = Database()
 
-# --- Клавиатуры ---
-def section_kb():
-    """Клавиатура выбора раздела"""
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("Пары", callback_data="sec_пары"),
-        InlineKeyboardButton("Будуар", callback_data="sec_будуар"),
-        InlineKeyboardButton("Гараж", callback_data="sec_гараж")
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def update_user_activity(user_id):
+    db.execute("UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+
+def get_user_status(user_id):
+    user = db.fetchone("SELECT status FROM users WHERE user_id = ?", (user_id,))
+    return user['status'] if user else 'new'
+
+# ========== КЛАВИАТУРЫ ==========
+def section_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton("Пары", callback_data="section_пары"),
+        types.InlineKeyboardButton("Будуар", callback_data="section_будуар"),
+        types.InlineKeyboardButton("Гараж", callback_data="section_гараж")
     )
-    return kb
+    return keyboard
 
-def mod_kb(user_id):
-    """Клавиатура модерации для админов"""
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Одобрить", callback_data=f"app_{user_id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"rej_{user_id}")
+def moderation_keyboard(application_id):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{application_id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{application_id}")
     )
-    return kb
+    return keyboard
 
-# --- Хендлеры бота ---
-@bot.message_handler(commands=["start", "help"])
-def start(message):
-    """Обработка команды /start"""
-    welcome_text = (
-        "👋 *Привет! Я бот для отправки контента.*\n\n"
-        "📋 *Как пользоваться:*\n"
-        "1. 👇 Нажмите кнопку ниже и выберите раздел\n"
-        "2. 📸 Отправьте фото или видео прямо в этот чат\n"
-        "3. ⏳ Дождитесь модерации\n"
-        "4. ✅ Получите уведомление о результате\n\n"
-        "⚠️ *Важно:* Ваш контент увидят только после проверки администратором.\n\n"
-        "📊 Проверить статус: /status\n"
-        "🔄 Сбросить раздел: /reset"
-    )
+# ========== ОСНОВНЫЕ ХЕНДЛЕРЫ ==========
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    """Первый контакт пользователя с ботом"""
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or ""
     
-    try:
-        bot.send_message(
-            message.chat.id,
-            welcome_text,
-            reply_markup=section_kb()
-        )
-        logger.info(f"Пользователь {message.from_user.id} начал диалог")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке приветствия: {e}")
-
-@bot.message_handler(commands=["status"])
-def status_command(message):
-    """Проверка статуса пользователя"""
-    uid = message.from_user.id
-    user_data = db.fetchone(
-        "SELECT section, approved FROM users WHERE user_id = ?",
-        (uid,)
-    )
+    logger.info(f"Пользователь {user_id} ({first_name}) начал работу")
     
-    if user_data:
-        section_name, approved = user_data
-        status_text = {
-            0: "⏳ Ожидает модерации",
-            1: "✅ Одобрено",
-            -1: "❌ Заблокирован"
-        }.get(approved, "❓ Неизвестный статус")
-        
-        response = (
-            f"📊 *Ваш статус:*\n\n"
-            f"👤 ID: `{uid}`\n"
-            f"📂 Раздел: {section_name}\n"
-            f"📈 Статус: {status_text}\n\n"
-            f"_Используйте /start для смены раздела_"
-        )
-    else:
-        response = (
-            "❌ *Вы еще не выбрали раздел.*\n\n"
-            "Используйте /start для выбора раздела."
-        )
+    # Проверяем, есть ли пользователь в БД
+    user = db.fetchone("SELECT status FROM users WHERE user_id = ?", (user_id,))
     
-    bot.reply_to(message, response)
-
-@bot.message_handler(commands=["reset"])
-def reset_command(message):
-    """Сброс выбранного раздела"""
-    uid = message.from_user.id
-    db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
-    
-    response = (
-        "🔄 *Раздел сброшен!*\n\n"
-        "Теперь вы можете выбрать новый раздел:"
-    )
-    
-    bot.send_message(message.chat.id, response, reply_markup=section_kb())
-    logger.info(f"Пользователь {uid} сбросил раздел")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
-def section_handler(call):
-    """Обработка выбора раздела"""
-    try:
-        bot.answer_callback_query(call.id, "Раздел выбран!")
-        
-        if not call.data or "_" not in call.data:
-            bot.edit_message_text(
-                "❌ Ошибка выбора раздела",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            return
-            
-        section_name = call.data.split("_", 1)[1]
-        uid = call.from_user.id
-        
-        # Проверяем валидность раздела
-        valid_sections = ["пары", "будуар", "гараж"]
-        if section_name.lower() not in valid_sections:
-            bot.edit_message_text(
-                "❌ Неверный раздел",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            return
-        
-        # Сохраняем в БД
+    if not user:
+        # НОВЫЙ пользователь
         db.execute(
-            "INSERT OR REPLACE INTO users (user_id, section, approved) VALUES (?, ?, 0)",
-            (uid, section_name)
+            "INSERT INTO users (user_id, username, first_name, status) VALUES (?, ?, ?, 'pending')",
+            (user_id, username, first_name)
         )
         
-        logger.info(f"Пользователь {uid} выбрал раздел: {section_name}")
-        
-        # Обновляем сообщение
-        success_text = (
-            f"✅ *Вы выбрали раздел: {section_name}*\n\n"
-            "📸 *Теперь отправьте фото или видео прямо в этот чат.*\n\n"
-            "_Бот обработает вашу заявку и отправит её на модерацию._"
+        response = (
+            "🔒 <b>ДОСТУП ЗАБЛОКИРОВАН</b>\n\n"
+            "Вы новый участник группы. Для получения доступа необходимо:\n\n"
+            "1. 📝 <b>Выбрать раздел</b> для своей анкеты\n"
+            "2. 📸 <b>Загрузить фото</b> (обычные + откровенные)\n"
+            "3. ⏳ <b>Ожидать проверки</b> администратором\n\n"
+            "📌 <b>Ваша анкета будет проверена администратором.</b>\n"
+            "При одобрении вы получите полный доступ ко всем разделам группы.\n"
+            "При отклонении - будете удалены из группы.\n\n"
+            "👇 <b>Выберите раздел для анкеты:</b>"
         )
         
-        try:
-            bot.edit_message_text(
-                success_text,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=None  # Убираем клавиатуру после выбора
-            )
-        except Exception as e:
-            # Если не удалось отредактировать сообщение
-            logger.warning(f"Не удалось отредактировать сообщение: {e}")
-            bot.send_message(
-                call.message.chat.id,
-                success_text
-            )
-            
-    except Exception as e:
-        logger.error(f"Ошибка в section_handler: {e}")
-        bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
-
-@bot.message_handler(content_types=["photo", "video", "animation", "document"])
-def media_handler(message):
-    """Обработка медиафайлов"""
-    try:
-        uid = message.from_user.id
-        username = message.from_user.username
-        first_name = message.from_user.first_name
+        bot.send_message(user_id, response, reply_markup=section_keyboard())
         
-        # Проверяем, выбрал ли пользователь раздел
-        user_data = db.fetchone(
-            "SELECT section, approved FROM users WHERE user_id = ?",
-            (uid,)
-        )
-        
-        if not user_data:
-            # Если раздел не выбран, показываем клавиатуру
-            bot.reply_to(
-                message,
-                "❌ *Сначала выберите раздел!*\n\n"
-                "Нажмите на кнопку ниже:",
-                reply_markup=section_kb()
-            )
-            return
-        
-        section_name, approved = user_data
-        
-        # Проверяем, не забанен ли пользователь
-        if approved == -1:
-            bot.reply_to(
-                message, 
-                "❌ *Вы заблокированы и не можете отправлять контент.*\n\n"
-                "Обратитесь к администратору для разблокировки."
-            )
-            return
-        
-        logger.info(f"Медиа от пользователя {uid}, раздел: {section_name}")
-        
-        # Отправляем админам
-        submission_time = datetime.now().strftime("%H:%M:%S")
+        # Уведомление админам
         for admin_id in ADMIN_IDS:
             try:
-                # Отправляем информацию о пользователе
-                user_info = (
-                    f"📨 *Новая анкета на модерацию*\n\n"
-                    f"👤 *Пользователь:*\n"
-                    f"ID: `{uid}`\n"
-                    f"Имя: {first_name}\n"
-                    f"Ник: @{username if username else 'нет'}\n\n"
-                    f"📂 *Раздел:* {section_name}\n"
-                    f"🕒 *Время:* {submission_time}\n\n"
-                    f"📎 *Тип:* {message.content_type}"
+                bot.send_message(
+                    admin_id,
+                    f"🆕 <b>Новый пользователь ожидает доступа</b>\n\n"
+                    f"👤 ID: <code>{user_id}</code>\n"
+                    f"📛 Ник: @{username if username else 'нет'}\n"
+                    f"👤 Имя: {first_name}\n"
+                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}",
+                    parse_mode="HTML"
                 )
-                
-                bot.send_message(admin_id, user_info)
-                
-                # Пересылаем медиа
-                bot.forward_message(admin_id, message.chat.id, message.message_id)
-                
-                # Клавиатура модерации
-                bot.send_message(admin_id, "📋 *Модерация:*", reply_markup=mod_kb(uid))
-                
-                logger.info(f"Уведомление отправлено админу {admin_id}")
-                
             except Exception as e:
-                logger.error(f"Не удалось отправить админу {admin_id}: {e}")
-        
-        # Подтверждение пользователю
-        bot.reply_to(
-            message,
-            "✅ *Ваша анкета отправлена на модерацию!*\n\n"
-            "⏳ *Ожидайте решения администратора.*\n\n"
-            "_Вы получите уведомление о результате._"
+                logger.error(f"Не удалось уведомить админа {admin_id}: {e}")
+    
+    elif user['status'] == 'pending':
+        # Пользователь уже создал анкету, но она на проверке
+        bot.send_message(
+            user_id,
+            "⏳ <b>Ваша анкета находится на проверке</b>\n\n"
+            "Администратор проверяет вашу анкету. "
+            "Ожидайте решения.\n\n"
+            "Вы получите уведомление о результате.",
+            parse_mode="HTML"
         )
-        
-    except Exception as e:
-        logger.error(f"Ошибка в media_handler: {e}")
-        bot.reply_to(message, "❌ Произошла ошибка при обработке медиа")
+    
+    elif user['status'] == 'approved':
+        # Пользователь одобрен и имеет доступ
+        bot.send_message(
+            user_id,
+            "✅ <b>ДОСТУП РАЗРЕШЕН</b>\n\n"
+            "Ваша анкета одобрена администратором.\n"
+            "Теперь у вас есть полный доступ ко всем разделам группы.\n\n"
+            "🎉 Добро пожаловать в сообщество!",
+            parse_mode="HTML"
+        )
+    
+    elif user['status'] in ['rejected', 'banned']:
+        # Пользователь отклонен или забанен
+        bot.send_message(
+            user_id,
+            "🚫 <b>ДОСТУП ЗАПРЕЩЕН</b>\n\n"
+            "Ваша анкета была отклонена администратором "
+            "или вы были забанены.\n\n"
+            "❌ Вы не можете использовать бота.",
+            parse_mode="HTML"
+        )
+    
+    update_user_activity(user_id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_")))
-def moderation_handler(call):
-    """Обработка модерации"""
-    try:
-        # Проверяем права администратора
-        if call.from_user.id not in ADMIN_IDS:
-            bot.answer_callback_query(call.id, "❌ У вас нет прав!", show_alert=True)
-            return
+@bot.callback_query_handler(func=lambda call: call.data.startswith('section_'))
+def section_handler(call):
+    """Обработка выбора раздела"""
+    user_id = call.from_user.id
+    section = call.data.split('_')[1]
+    
+    # Проверяем статус пользователя
+    user_status = get_user_status(user_id)
+    
+    if user_status != 'pending':
+        bot.answer_callback_query(call.id, "❌ Неверный статус пользователя")
+        return
+    
+    # Создаем новую анкету
+    application_id = db.execute(
+        "INSERT INTO applications (user_id, section) VALUES (?, ?)",
+        (user_id, section),
+        return_id=True
+    )
+    
+    if not application_id:
+        bot.answer_callback_query(call.id, "❌ Ошибка создания анкеты", show_alert=True)
+        return
+    
+    bot.answer_callback_query(call.id, f"✅ Выбран раздел: {section}")
+    
+    # Инструкции пользователю
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=(
+            f"📂 <b>Раздел выбран: {section}</b>\n\n"
+            "📋 <b>Требования к анкете:</b>\n"
+            "1. 📸 <b>Обычные фото</b> (1 или более)\n"
+            "   • Без посторонних лиц\n"
+            "   • Не интимные\n\n"
+            "2. 🔞 <b>Интимные фото</b> (1 или более)\n"
+            "   • Откровенные фото\n\n"
+            "👇 <b>Загружайте фото по одному.</b>\n"
+            "После загрузки всех фото анкета отправится на проверку.\n\n"
+            "<i>Используйте команду /cancel для отмены</i>"
+        ),
+        parse_mode="HTML"
+    )
+
+@bot.message_handler(commands=['cancel'])
+def cancel_handler(message):
+    """Отмена создания анкеты"""
+    user_id = message.from_user.id
+    user_status = get_user_status(user_id)
+    
+    if user_status == 'pending':
+        # Удаляем неотправленные анкеты
+        db.execute("DELETE FROM applications WHERE user_id = ? AND status = 'pending'", (user_id,))
         
-        bot.answer_callback_query(call.id, "Решение принято!")
-        
-        # Разбираем callback data
-        parts = call.data.split("_")
-        if len(parts) != 2:
-            return
-        
-        action, uid_str = parts
-        uid = int(uid_str)
-        
-        # Получаем информацию о пользователе
-        user_data = db.fetchone(
-            "SELECT section FROM users WHERE user_id = ?",
-            (uid,)
+        bot.send_message(
+            user_id,
+            "❌ <b>Создание анкеты отменено</b>\n\n"
+            "Вы можете начать заново командой /start",
+            parse_mode="HTML"
         )
-        
-        section_name = user_data[0] if user_data else "неизвестно"
-        
-        # Обновляем статус в БД
-        if action == "app":
-            db.execute(
-                "UPDATE users SET approved = 1 WHERE user_id = ?",
-                (uid,)
-            )
-            status_text = "✅ Одобрена"
-            user_message = (
-                "🎉 *Ваша анкета одобрена!*\n\n"
-                "✅ *Статус:* Одобрено администратором\n"
-                f"📂 *Раздел:* {section_name}\n\n"
-                "Теперь ваш контент будет доступен другим пользователям."
-            )
-        else:  # rej
-            db.execute(
-                "UPDATE users SET approved = -1 WHERE user_id = ?",
-                (uid,)
-            )
-            status_text = "❌ Отклонена"
-            user_message = (
-                "❌ *Ваша анкета отклонена.*\n\n"
-                "🔄 Вы можете отправить новый контент, но сначала выберите раздел: /start"
-            )
-        
-        # Отправляем решение пользователю
+    else:
+        bot.send_message(
+            user_id,
+            "ℹ️ <b>Нет активного создания анкеты</b>",
+            parse_mode="HTML"
+        )
+
+# ========== ОБРАБОТКА ФОТО ==========
+user_temp_data = {}  # Временное хранение данных пользователя
+
+@bot.message_handler(content_types=['photo'])
+def photo_handler(message):
+    """Обработка загружаемых фото"""
+    user_id = message.from_user.id
+    user_status = get_user_status(user_id)
+    
+    if user_status != 'pending':
+        bot.reply_to(message, "❌ Сначала выберите раздел для анкеты (/start)")
+        return
+    
+    # Получаем активную анкету пользователя
+    application = db.fetchone(
+        "SELECT id, section FROM applications WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+        (user_id,)
+    )
+    
+    if not application:
+        bot.reply_to(message, "❌ Сначала выберите раздел для анкеты (/start)")
+        return
+    
+    application_id = application['id']
+    
+    # Определяем тип фото
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("📸 Обычное", callback_data=f"photo_normal_{application_id}"),
+        types.InlineKeyboardButton("🔞 Интимное", callback_data=f"photo_intimate_{application_id}")
+    )
+    
+    # Сохраняем file_id временно
+    file_id = message.photo[-1].file_id
+    if user_id not in user_temp_data:
+        user_temp_data[user_id] = {}
+    user_temp_data[user_id]['last_photo'] = file_id
+    user_temp_data[user_id]['application_id'] = application_id
+    
+    bot.reply_to(
+        message,
+        "📸 <b>Фото получено!</b>\n\n"
+        "Выберите тип фото:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('photo_'))
+def photo_type_handler(call):
+    """Обработка выбора типа фото"""
+    user_id = call.from_user.id
+    parts = call.data.split('_')
+    photo_type = parts[1]  # normal или intimate
+    application_id = int(parts[2])
+    
+    if user_id not in user_temp_data or 'last_photo' not in user_temp_data[user_id]:
+        bot.answer_callback_query(call.id, "❌ Фото не найдено", show_alert=True)
+        return
+    
+    file_id = user_temp_data[user_id]['last_photo']
+    
+    # Сохраняем фото в БД
+    db.execute(
+        "INSERT INTO application_photos (application_id, photo_type, file_id) VALUES (?, ?, ?)",
+        (application_id, photo_type, file_id)
+    )
+    
+    # Получаем статистику по анкете
+    photos = db.fetchall(
+        "SELECT photo_type, COUNT(*) as count FROM application_photos WHERE application_id = ? GROUP BY photo_type",
+        (application_id,)
+    )
+    
+    normal_count = 0
+    intimate_count = 0
+    for photo in photos:
+        if photo['photo_type'] == 'normal':
+            normal_count = photo['count']
+        else:
+            intimate_count = photo['count']
+    
+    bot.answer_callback_query(call.id, f"✅ Добавлено {photo_type} фото")
+    
+    # Показываем статистику
+    stats_text = (
+        f"📊 <b>Текущая анкета:</b>\n\n"
+        f"📸 Обычных фото: {normal_count}\n"
+        f"🔞 Интимных фото: {intimate_count}\n\n"
+    )
+    
+    if normal_count >= 1 and intimate_count >= 1:
+        # Все требования выполнены
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("📤 Отправить на проверку", callback_data=f"submit_{application_id}"))
+        stats_text += "✅ <b>Все требования выполнены!</b>\nМожно отправить анкету на проверку."
+    else:
+        keyboard = None
+        stats_text += "👇 <b>Продолжайте загружать фото</b>\nТребуется минимум 1 обычное и 1 интимное фото."
+    
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=stats_text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    except:
+        pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('submit_'))
+def submit_application_handler(call):
+    """Отправка анкеты на проверку"""
+    application_id = int(call.data.split('_')[1])
+    user_id = call.from_user.id
+    
+    # Получаем данные анкеты
+    application = db.fetchone(
+        """SELECT a.*, u.username, u.first_name 
+           FROM applications a 
+           JOIN users u ON a.user_id = u.user_id 
+           WHERE a.id = ?""",
+        (application_id,)
+    )
+    
+    if not application:
+        bot.answer_callback_query(call.id, "❌ Анкета не найдена", show_alert=True)
+        return
+    
+    # Меняем статус анкеты на "на проверке"
+    db.execute("UPDATE applications SET status = 'pending' WHERE id = ?", (application_id,))
+    
+    # Получаем все фото анкеты
+    photos = db.fetchall(
+        "SELECT photo_type, file_id FROM application_photos WHERE application_id = ?",
+        (application_id,)
+    )
+    
+    # Отправляем админам
+    for admin_id in ADMIN_IDS:
         try:
-            bot.send_message(uid, user_message)
-            logger.info(f"Решение отправлено пользователю {uid}: {action}")
-        except apihelper.ApiTelegramException as e:
-            if e.error_code == 403:
-                logger.warning(f"Пользователь {uid} заблокировал бота")
-            else:
-                logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
+            # Информация об анкете
+            info_msg = (
+                f"📨 <b>НОВАЯ АНКЕТА НА ПРОВЕРКУ</b>\n\n"
+                f"👤 <b>Пользователь:</b>\n"
+                f"ID: <code>{application['user_id']}</code>\n"
+                f"Ник: @{application['username'] if application['username'] else 'нет'}\n"
+                f"Имя: {application['first_name']}\n\n"
+                f"📂 <b>Раздел:</b> {application['section']}\n"
+                f"📸 <b>Фото:</b> {len(photos)} шт.\n"
+                f"🕒 <b>Время:</b> {application['created_at'][:16]}\n\n"
+                f"👇 <b>Фото анкеты:</b>"
+            )
+            
+            bot.send_message(admin_id, info_msg, parse_mode="HTML")
+            
+            # Отправляем фото
+            for photo in photos:
+                caption = "📸 Обычное фото" if photo['photo_type'] == 'normal' else "🔞 Интимное фото"
+                bot.send_photo(admin_id, photo['file_id'], caption=caption)
+            
+            # Клавиатура модерации
+            bot.send_message(
+                admin_id,
+                "📋 <b>Решение по анкете:</b>",
+                reply_markup=moderation_keyboard(application_id),
+                parse_mode="HTML"
+            )
+            
+        except Exception as e:
+            logger.error(f"Не удалось отправить админу {admin_id}: {e}")
+    
+    # Подтверждение пользователю
+    bot.answer_callback_query(call.id, "✅ Анкета отправлена на проверку")
+    
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=(
+            "✅ <b>Анкета отправлена на проверку!</b>\n\n"
+            "Администратор проверит вашу анкету. "
+            "Ожидайте решения.\n\n"
+            "📌 <b>Примечание:</b>\n"
+            "• При одобрении - полный доступ ко всем разделам\n"
+            "• При отклонении - удаление из группы\n\n"
+            "Вы получите уведомление о результате."
+        ),
+        parse_mode="HTML"
+    )
+
+# ========== МОДЕРАЦИЯ ==========
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('approve_', 'reject_')))
+def moderation_handler(call):
+    """Обработка модерации админом"""
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "❌ Нет прав", show_alert=True)
+        return
+    
+    action = call.data.split('_')[0]  # approve или reject
+    application_id = int(call.data.split('_')[1])
+    
+    # Получаем данные анкеты
+    application = db.fetchone(
+        """SELECT a.*, u.user_id, u.username, u.first_name 
+           FROM applications a 
+           JOIN users u ON a.user_id = u.user_id 
+           WHERE a.id = ?""",
+        (application_id,)
+    )
+    
+    if not application:
+        bot.answer_callback_query(call.id, "❌ Анкета не найдена", show_alert=True)
+        return
+    
+    user_id = application['user_id']
+    
+    if action == 'approve':
+        # ОДОБРЕНИЕ
+        db.execute(
+            "UPDATE applications SET status = 'approved', moderated_at = CURRENT_TIMESTAMP, moderator_id = ? WHERE id = ?",
+            (call.from_user.id, application_id)
+        )
+        db.execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (user_id,))
+        
+        # Уведомляем пользователя
+        try:
+            bot.send_message(
+                user_id,
+                "🎉 <b>ВАША АНКЕТА ОДОБРЕНА!</b>\n\n"
+                "✅ Администратор проверил и одобрил вашу анкету.\n\n"
+                "🎊 <b>Теперь у вас есть:</b>\n"
+                "• Полный доступ ко всем разделам группы\n"
+                "• Возможность просматривать анкеты других участников\n"
+                "• Полная свобода действий согласно правилам группы\n\n"
+                "Добро пожаловать в сообщество! 🎉",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
+        
+        bot.answer_callback_query(call.id, "✅ Анкета одобрена")
         
         # Обновляем сообщение админу
         try:
@@ -421,164 +544,96 @@ def moderation_handler(call):
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=(
-                    f"📋 *Модерация завершена*\n\n"
-                    f"👤 *Пользователь:* `{uid}`\n"
-                    f"📂 *Раздел:* {section_name}\n"
-                    f"📊 *Решение:* {status_text}\n"
-                    f"👨‍💼 *Модератор:* {call.from_user.first_name}\n\n"
-                    f"🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}"
-                )
+                    f"✅ <b>АНКЕТА ОДОБРЕНА</b>\n\n"
+                    f"👤 Пользователь: <code>{user_id}</code>\n"
+                    f"📛 Ник: @{application['username'] if application['username'] else 'нет'}\n"
+                    f"📂 Раздел: {application['section']}\n"
+                    f"👨‍💼 Модератор: {call.from_user.first_name}\n"
+                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    f"<i>Пользователь получил полный доступ ко всем разделам</i>"
+                ),
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        
+    else:
+        # ОТКЛОНЕНИЕ
+        db.execute(
+            "UPDATE applications SET status = 'rejected', moderated_at = CURRENT_TIMESTAMP, moderator_id = ? WHERE id = ?",
+            (call.from_user.id, application_id)
+        )
+        db.execute("UPDATE users SET status = 'banned' WHERE user_id = ?", (user_id,))
+        
+        # Уведомляем пользователя
+        try:
+            bot.send_message(
+                user_id,
+                "🚫 <b>ВАША АНКЕТА ОТКЛОНЕНА</b>\n\n"
+                "❌ Администратор отклонил вашу анкету.\n\n"
+                "📌 <b>Последствия:</b>\n"
+                "• Вы удалены из группы\n"
+                "• Доступ к боту заблокирован\n"
+                "• Повторная подача анкеты невозможна\n\n"
+                "Ваш аккаунт добавлен в чёрный список.",
+                parse_mode="HTML"
             )
         except Exception as e:
-            logger.warning(f"Не удалось отредактировать сообщение: {e}")
+            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
         
-        logger.info(f"Модерация: {action} для пользователя {uid}, раздел: {section_name}")
+        bot.answer_callback_query(call.id, "❌ Анкета отклонена")
         
-    except Exception as e:
-        logger.error(f"Ошибка в moderation_handler: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка!", show_alert=True)
-
-@bot.message_handler(func=lambda message: True)
-def other_messages(message):
-    """Обработка всех остальных сообщений"""
-    if message.text and message.text.startswith('/'):
-        bot.reply_to(
-            message,
-            "❌ *Неизвестная команда.*\n\n"
-            "Доступные команды:\n"
-            "/start - Начать работу с ботом\n"
-            "/status - Проверить статус\n"
-            "/reset - Сбросить раздел\n"
-            "/help - Помощь"
-        )
-    elif message.text:
-        # Если текст не команда, проверяем статус пользователя
-        uid = message.from_user.id
-        user_data = db.fetchone(
-            "SELECT section FROM users WHERE user_id = ?",
-            (uid,)
-        )
-        
-        if user_data:
-            bot.reply_to(
-                message,
-                "📸 *Отправьте фото или видео для модерации.*\n\n"
-                f"Ваш текущий раздел: {user_data[0]}\n\n"
-                "Изменить раздел: /start"
+        # Обновляем сообщение админу
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    f"❌ <b>АНКЕТА ОТКЛОНЕНА</b>\n\n"
+                    f"👤 Пользователь: <code>{user_id}</code>\n"
+                    f"📛 Ник: @{application['username'] if application['username'] else 'нет'}\n"
+                    f"📂 Раздел: {application['section']}\n"
+                    f"👨‍💼 Модератор: {call.from_user.first_name}\n"
+                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    f"<i>Пользователь забанен и удалён из системы</i>"
+                ),
+                parse_mode="HTML"
             )
-        else:
-            bot.reply_to(
-                message,
-                "👋 *Сначала выберите раздел!*\n\n"
-                "Используйте /start для начала работы.",
-                reply_markup=section_kb()
-            )
+        except:
+            pass
 
-# --- Flask health-check server (для Render Web Service) ---
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "🤖 Бот работает!", 200
-
-@app.route('/health')
-def health():
-    """Endpoint для проверки здоровья приложения"""
-    # Проверяем соединение с БД
-    try:
-        test_result = db.fetchone("SELECT 1")
-        db_status = "connected" if test_result else "error"
-    except Exception as e:
-        db_status = f"error: {str(e)}"
+# ========== АДМИН КОМАНДЫ ==========
+@bot.message_handler(commands=['admin'])
+def admin_handler(message):
+    """Панель администратора"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
     
-    return {
-        "status": "alive",
-        "timestamp": datetime.now().isoformat(),
-        "service": "telegram-bot",
-        "database": db_status,
-        "admins_count": len(ADMIN_IDS)
-    }, 200
-
-@app.route('/stats')
-def stats():
-    """Статистика бота (только для админов)"""
-    try:
-        total_users = db.fetchone("SELECT COUNT(*) FROM users")[0]
-        pending = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 0")[0]
-        approved = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = 1")[0]
-        rejected = db.fetchone("SELECT COUNT(*) FROM users WHERE approved = -1")[0]
-        
-        return {
-            "total_users": total_users,
-            "pending_moderation": pending,
-            "approved": approved,
-            "rejected": rejected,
-            "timestamp": datetime.now().isoformat()
-        }, 200
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-def run_flask():
-    """Запуск Flask в отдельном потоке"""
-    # Отключаем логирование Flask
-    import logging as flask_logging
-    flask_logging.getLogger('werkzeug').setLevel(flask_logging.WARNING)
+    # Статистика
+    total_users = db.fetchone("SELECT COUNT(*) as count FROM users")['count']
+    pending_apps = db.fetchone("SELECT COUNT(*) as count FROM applications WHERE status = 'pending'")['count']
+    approved_users = db.fetchone("SELECT COUNT(*) as count FROM users WHERE status = 'approved'")['count']
     
-    port = int(os.getenv("PORT", 10000))  # Render использует порт 10000
-    logger.info(f"Запуск Flask сервера на порту {port}")
-    
-    app.run(
-        host='0.0.0.0',
-        port=port,
-        debug=False,
-        use_reloader=False,
-        threaded=True
+    response = (
+        f"👨‍💼 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"• 👥 Всего пользователей: {total_users}\n"
+        f"• ✅ Одобренных: {approved_users}\n"
+        f"• ⏳ Ожидают проверки: {pending_apps}\n\n"
+        f"🛠 <b>Доступные команды:</b>\n"
+        f"/users - Список пользователей\n"
+        f"/pending - Анкеты на проверке\n"
+        f"/stats - Подробная статистика"
     )
+    
+    bot.reply_to(message, response, parse_mode="HTML")
 
-def signal_handler(signum, frame):
-    """Обработка сигналов завершения"""
-    logger.info(f"Получен сигнал {signum}. Завершение работы...")
-    sys.exit(0)
-
-# --- Запуск ---
+# ========== ЗАПУСК ==========
 if __name__ == '__main__':
-    # Регистрируем обработчики сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    logger.info("=" * 50)
-    logger.info("🚀 Запуск Telegram бота")
-    
-    try:
-        bot_info = bot.get_me()
-        logger.info(f"🤖 Бот: @{bot_info.username} ({bot_info.first_name})")
-    except Exception as e:
-        logger.error(f"Не удалось получить информацию о боте: {e}")
-        logger.error("Проверьте:")
-        logger.error("1. Правильность токена на Render")
-        logger.error("2. Что токен активен (не ревокнут)")
-        logger.error("3. Сетевое соединение")
-        sys.exit(1)
-    
+    logger.info(f"🤖 Бот запускается...")
     logger.info(f"👨‍💼 Админы: {ADMIN_IDS}")
-    logger.info("=" * 50)
     
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Запускаем бота
     try:
-        logger.info("🔄 Начинаем polling...")
-        bot.infinity_polling(
-            timeout=60,
-            long_polling_timeout=30,
-            logger_level=logging.WARNING
-        )
-    except KeyboardInterrupt:
-        logger.info("⏹ Остановка по запросу пользователя...")
+        bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except Exception as e:
-        logger.error(f"Критическая ошибка бота: {e}")
-        sys.exit(1)
-    finally:
-        logger.info("🤖 Бот остановлен")
+        logger.error(f"Ошибка бота: {e}")
