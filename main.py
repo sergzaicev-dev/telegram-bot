@@ -37,22 +37,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- НАСТРОЙКИ ----------
-BOT_TOKEN = os.getenv("8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI")
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN не задан в окружении. Завершение.")
-    sys.exit(1)
-BOT_TOKEN = BOT_TOKEN.strip()
 
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "5064426902")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()]
-if not ADMIN_IDS:
-    # Фоллбек — укажи свои ID в окружении
-    logger.warning("ADMIN_IDS не задан. Используется пустой список админов.")
-    ADMIN_IDS = []
+# Токен бота (строго в кавычках)
+BOT_TOKEN = "8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI"
 
-RATE_LIMIT_MINUTES = int(os.getenv("RATE_LIMIT_MINUTES", "5"))
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "secret")
+# ID администраторов (список чисел)
+ADMIN_IDS = [5064426902]  # можешь добавить через запятую несколько ID
 
+# Лимит частоты (минуты). Если не используешь — оставляй как есть.
+RATE_LIMIT_MINUTES = 5
+
+# Ключ для внутреннего API админов (можешь оставить любое значение)
+ADMIN_API_KEY = "secret"
+
+# Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 # ---------- БАЗА ДАННЫХ (потокобезопасно) ----------
@@ -758,3 +756,4 @@ if __name__ == "__main__":
             except Exception:
                 pass
         sys.exit(1)
+
