@@ -1,78 +1,129 @@
 import os
 import telebot
-from telebot import types
+from telebot import apihelper
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import sqlite3
 import threading
 import logging
-from datetime import datetime
+from flask import Flask, request
+import signal
+import sys
+from datetime import datetime, timedelta
+import json
 import time
 
-# ========== НАСТРОЙКА ==========
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Настройка логирования ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+
+if not BOT_TOKEN:
+    logger.error("❌ ОШИБКА: BOT_TOKEN не задан в переменных окружения.")
+    sys.exit(1)
+
+BOT_TOKEN = BOT_TOKEN.strip()
+
+if ':' not in BOT_TOKEN:
+    logger.error(f"❌ НЕПРАВИЛЬНЫЙ ФОРМАТ ТОКЕНА")
+    sys.exit(1)
+
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "5064426902")
+ADMIN_IDS = [int(id.strip()) for id in ADMIN_IDS_STR.split(",") if id.strip().isdigit()]
 if not ADMIN_IDS:
-    ADMIN_IDS = [5064426902]  # Fallback
+    ADMIN_IDS = [5064426902]
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+RATE_LIMIT_MINUTES = int(os.getenv("RATE_LIMIT_MINUTES", "5"))
 
-# ========== БАЗА ДАННЫХ ==========
-class Database:
-    def __init__(self, db_path='bot.db'):
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+logger.info(f"✅ Бот инициализирован. ID: {BOT_TOKEN.split(':')[0]}")
+logger.info(f"👨‍💼 Админы: {ADMIN_IDS}")
+logger.info(f"⏱️ Лимит отправки: {RATE_LIMIT_MINUTES} мин")
+
+# --- Потокобезопасная работа с базой данных ---
+class DatabaseManager:
+    def __init__(self, db_path='users.db'):
         self.db_path = db_path
         self.lock = threading.Lock()
-        self.init_db()
+        self._init_db()
     
-    def init_db(self):
+    def _init_db(self):
+        """Инициализация базы данных с новой структурой"""
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             
-            # Пользователи
-            cursor.execute('''
+            # Таблица пользователей (новая структура со статусами)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
-                    status TEXT DEFAULT 'pending',  # pending, approved, rejected, banned
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    last_name TEXT,
+                    status TEXT DEFAULT 'pending',  -- pending/active/banned
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
+            """)
             
-            # Анкеты
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS applications (
+            # Таблица выбранных разделов
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_sections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    section TEXT NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                )
+            """)
+            
+            # Таблица заявок (анкет)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS submissions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
                     section TEXT NOT NULL,
-                    status TEXT DEFAULT 'pending',  # pending, approved, rejected
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    moderated_at TIMESTAMP,
+                    media_type TEXT NOT NULL,  -- regular/intimate
+                    file_ids TEXT NOT NULL,    -- JSON массив file_id
+                    approved INTEGER DEFAULT 0,  -- 0=ожидает, 1=одобрено, -1=отклонено
                     moderator_id INTEGER,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            ''')
-            
-            # Фото анкет
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS application_photos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    application_id INTEGER NOT NULL,
-                    photo_type TEXT NOT NULL,  # normal, intimate
-                    file_id TEXT NOT NULL,
+                    moderated_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
+                    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
                 )
-            ''')
+            """)
+            
+            # Таблица медиафайлов (для хранения file_id отдельно)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS media_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id INTEGER,
+                    file_id TEXT NOT NULL,
+                    media_type TEXT NOT NULL,  -- photo/video/animation
+                    content_type TEXT NOT NULL, -- regular/intimate
+                    FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+                )
+            """)
+            
+            # Индексы
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_submissions_user ON submissions(user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(approved)")
             
             conn.commit()
             conn.close()
-        logger.info("База данных инициализирована")
     
     def execute(self, query, params=(), return_id=False):
+        """Безопасное выполнение запроса"""
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
@@ -81,559 +132,690 @@ class Database:
                 conn.commit()
                 result = cursor.lastrowid if return_id else cursor.rowcount
             except Exception as e:
-                logger.error(f"Ошибка БД: {e}")
+                logger.error(f"Ошибка БД при выполнении запроса: {e}")
                 result = None
             finally:
                 conn.close()
             return result
     
     def fetchone(self, query, params=()):
+        """Безопасное получение одной записи"""
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
-                row = cursor.fetchone()
-                return dict(row) if row else None
+                result = cursor.fetchone()
+                if result:
+                    result = dict(result)
             except Exception as e:
-                logger.error(f"Ошибка fetchone: {e}")
-                return None
+                logger.error(f"Ошибка БД при fetchone: {e}")
+                result = None
             finally:
                 conn.close()
+            return result
     
     def fetchall(self, query, params=()):
+        """Безопасное получение всех записей"""
         with self.lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             try:
                 cursor.execute(query, params)
-                return [dict(row) for row in cursor.fetchall()]
+                results = cursor.fetchall()
+                if results:
+                    results = [dict(row) for row in results]
+                else:
+                    results = []
             except Exception as e:
-                logger.error(f"Ошибка fetchall: {e}")
-                return []
+                logger.error(f"Ошибка БД при fetchall: {e}")
+                results = []
             finally:
                 conn.close()
+            return results
 
-db = Database()
+# Инициализация менеджера БД
+db = DatabaseManager()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-def update_user_activity(user_id):
-    db.execute("UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
-
-def get_user_status(user_id):
-    user = db.fetchone("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    return user['status'] if user else 'new'
-
-# ========== КЛАВИАТУРЫ ==========
-def section_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        types.InlineKeyboardButton("Пары", callback_data="section_пары"),
-        types.InlineKeyboardButton("Будуар", callback_data="section_будуар"),
-        types.InlineKeyboardButton("Гараж", callback_data="section_гараж")
-    )
-    return keyboard
-
-def moderation_keyboard(application_id):
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{application_id}"),
-        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{application_id}")
-    )
-    return keyboard
-
-# ========== ОСНОВНЫЕ ХЕНДЛЕРЫ ==========
-@bot.message_handler(commands=['start'])
-def start_handler(message):
-    """Первый контакт пользователя с ботом"""
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or ""
+# --- Вспомогательные функции ---
+def update_user_info(user_id, username, first_name, last_name=""):
+    """Обновление информации о пользователе"""
+    # Проверяем, существует ли пользователь
+    existing = db.fetchone("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
     
-    logger.info(f"Пользователь {user_id} ({first_name}) начал работу")
-    
-    # Проверяем, есть ли пользователь в БД
-    user = db.fetchone("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    
-    if not user:
-        # НОВЫЙ пользователь
+    if existing:
+        # Обновляем существующего
         db.execute(
-            "INSERT INTO users (user_id, username, first_name, status) VALUES (?, ?, ?, 'pending')",
-            (user_id, username, first_name)
-        )
-        
-        response = (
-            "🔒 <b>ДОСТУП ЗАБЛОКИРОВАН</b>\n\n"
-            "Вы новый участник группы. Для получения доступа необходимо:\n\n"
-            "1. 📝 <b>Выбрать раздел</b> для своей анкеты\n"
-            "2. 📸 <b>Загрузить фото</b> (обычные + откровенные)\n"
-            "3. ⏳ <b>Ожидать проверки</b> администратором\n\n"
-            "📌 <b>Ваша анкета будет проверена администратором.</b>\n"
-            "При одобрении вы получите полный доступ ко всем разделам группы.\n"
-            "При отклонении - будете удалены из группы.\n\n"
-            "👇 <b>Выберите раздел для анкеты:</b>"
-        )
-        
-        bot.send_message(user_id, response, reply_markup=section_keyboard())
-        
-        # Уведомление админам
-        for admin_id in ADMIN_IDS:
-            try:
-                bot.send_message(
-                    admin_id,
-                    f"🆕 <b>Новый пользователь ожидает доступа</b>\n\n"
-                    f"👤 ID: <code>{user_id}</code>\n"
-                    f"📛 Ник: @{username if username else 'нет'}\n"
-                    f"👤 Имя: {first_name}\n"
-                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Не удалось уведомить админа {admin_id}: {e}")
-    
-    elif user['status'] == 'pending':
-        # Пользователь уже создал анкету, но она на проверке
-        bot.send_message(
-            user_id,
-            "⏳ <b>Ваша анкета находится на проверке</b>\n\n"
-            "Администратор проверяет вашу анкету. "
-            "Ожидайте решения.\n\n"
-            "Вы получите уведомление о результате.",
-            parse_mode="HTML"
-        )
-    
-    elif user['status'] == 'approved':
-        # Пользователь одобрен и имеет доступ
-        bot.send_message(
-            user_id,
-            "✅ <b>ДОСТУП РАЗРЕШЕН</b>\n\n"
-            "Ваша анкета одобрена администратором.\n"
-            "Теперь у вас есть полный доступ ко всем разделам группы.\n\n"
-            "🎉 Добро пожаловать в сообщество!",
-            parse_mode="HTML"
-        )
-    
-    elif user['status'] in ['rejected', 'banned']:
-        # Пользователь отклонен или забанен
-        bot.send_message(
-            user_id,
-            "🚫 <b>ДОСТУП ЗАПРЕЩЕН</b>\n\n"
-            "Ваша анкета была отклонена администратором "
-            "или вы были забанены.\n\n"
-            "❌ Вы не можете использовать бота.",
-            parse_mode="HTML"
-        )
-    
-    update_user_activity(user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('section_'))
-def section_handler(call):
-    """Обработка выбора раздела"""
-    user_id = call.from_user.id
-    section = call.data.split('_')[1]
-    
-    # Проверяем статус пользователя
-    user_status = get_user_status(user_id)
-    
-    if user_status != 'pending':
-        bot.answer_callback_query(call.id, "❌ Неверный статус пользователя")
-        return
-    
-    # Создаем новую анкету
-    application_id = db.execute(
-        "INSERT INTO applications (user_id, section) VALUES (?, ?)",
-        (user_id, section),
-        return_id=True
-    )
-    
-    if not application_id:
-        bot.answer_callback_query(call.id, "❌ Ошибка создания анкеты", show_alert=True)
-        return
-    
-    bot.answer_callback_query(call.id, f"✅ Выбран раздел: {section}")
-    
-    # Инструкции пользователю
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=(
-            f"📂 <b>Раздел выбран: {section}</b>\n\n"
-            "📋 <b>Требования к анкете:</b>\n"
-            "1. 📸 <b>Обычные фото</b> (1 или более)\n"
-            "   • Без посторонних лиц\n"
-            "   • Не интимные\n\n"
-            "2. 🔞 <b>Интимные фото</b> (1 или более)\n"
-            "   • Откровенные фото\n\n"
-            "👇 <b>Загружайте фото по одному.</b>\n"
-            "После загрузки всех фото анкета отправится на проверку.\n\n"
-            "<i>Используйте команду /cancel для отмены</i>"
-        ),
-        parse_mode="HTML"
-    )
-
-@bot.message_handler(commands=['cancel'])
-def cancel_handler(message):
-    """Отмена создания анкеты"""
-    user_id = message.from_user.id
-    user_status = get_user_status(user_id)
-    
-    if user_status == 'pending':
-        # Удаляем неотправленные анкеты
-        db.execute("DELETE FROM applications WHERE user_id = ? AND status = 'pending'", (user_id,))
-        
-        bot.send_message(
-            user_id,
-            "❌ <b>Создание анкеты отменено</b>\n\n"
-            "Вы можете начать заново командой /start",
-            parse_mode="HTML"
+            """UPDATE users 
+               SET username = ?, first_name = ?, last_name = ?, last_activity = CURRENT_TIMESTAMP 
+               WHERE user_id = ?""",
+            (username, first_name, last_name, user_id)
         )
     else:
-        bot.send_message(
-            user_id,
-            "ℹ️ <b>Нет активного создания анкеты</b>",
-            parse_mode="HTML"
+        # Создаем нового со статусом pending
+        db.execute(
+            """INSERT INTO users 
+               (user_id, username, first_name, last_name, status, last_activity) 
+               VALUES (?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)""",
+            (user_id, username, first_name, last_name)
         )
 
-# ========== ОБРАБОТКА ФОТО ==========
-user_temp_data = {}  # Временное хранение данных пользователя
+def get_user_status(user_id):
+    """Получение статуса пользователя"""
+    user_data = db.fetchone(
+        "SELECT status FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    return user_data['status'] if user_data else 'pending'
 
-@bot.message_handler(content_types=['photo'])
-def photo_handler(message):
-    """Обработка загружаемых фото"""
-    user_id = message.from_user.id
-    user_status = get_user_status(user_id)
-    
-    if user_status != 'pending':
-        bot.reply_to(message, "❌ Сначала выберите раздел для анкеты (/start)")
-        return
-    
-    # Получаем активную анкету пользователя
-    application = db.fetchone(
-        "SELECT id, section FROM applications WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+def set_user_status(user_id, status):
+    """Установка статуса пользователя"""
+    db.execute(
+        "UPDATE users SET status = ? WHERE user_id = ?",
+        (status, user_id)
+    )
+
+def get_user_section(user_id):
+    """Получение активного раздела пользователя"""
+    section = db.fetchone(
+        """SELECT section FROM user_sections 
+           WHERE user_id = ? AND is_active = 1 
+           ORDER BY created_at DESC LIMIT 1""",
+        (user_id,)
+    )
+    return section['section'] if section else None
+
+def set_user_section(user_id, section_name):
+    """Установка раздела для пользователя"""
+    # Деактивируем предыдущий активный раздел
+    db.execute(
+        "UPDATE user_sections SET is_active = 0 WHERE user_id = ? AND is_active = 1",
         (user_id,)
     )
     
-    if not application:
-        bot.reply_to(message, "❌ Сначала выберите раздел для анкеты (/start)")
-        return
-    
-    application_id = application['id']
-    
-    # Определяем тип фото
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton("📸 Обычное", callback_data=f"photo_normal_{application_id}"),
-        types.InlineKeyboardButton("🔞 Интимное", callback_data=f"photo_intimate_{application_id}")
-    )
-    
-    # Сохраняем file_id временно
-    file_id = message.photo[-1].file_id
-    if user_id not in user_temp_data:
-        user_temp_data[user_id] = {}
-    user_temp_data[user_id]['last_photo'] = file_id
-    user_temp_data[user_id]['application_id'] = application_id
-    
-    bot.reply_to(
-        message,
-        "📸 <b>Фото получено!</b>\n\n"
-        "Выберите тип фото:",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('photo_'))
-def photo_type_handler(call):
-    """Обработка выбора типа фото"""
-    user_id = call.from_user.id
-    parts = call.data.split('_')
-    photo_type = parts[1]  # normal или intimate
-    application_id = int(parts[2])
-    
-    if user_id not in user_temp_data or 'last_photo' not in user_temp_data[user_id]:
-        bot.answer_callback_query(call.id, "❌ Фото не найдено", show_alert=True)
-        return
-    
-    file_id = user_temp_data[user_id]['last_photo']
-    
-    # Сохраняем фото в БД
+    # Добавляем новый раздел
     db.execute(
-        "INSERT INTO application_photos (application_id, photo_type, file_id) VALUES (?, ?, ?)",
-        (application_id, photo_type, file_id)
+        "INSERT INTO user_sections (user_id, section) VALUES (?, ?)",
+        (user_id, section_name)
     )
-    
-    # Получаем статистику по анкете
-    photos = db.fetchall(
-        "SELECT photo_type, COUNT(*) as count FROM application_photos WHERE application_id = ? GROUP BY photo_type",
-        (application_id,)
-    )
-    
-    normal_count = 0
-    intimate_count = 0
-    for photo in photos:
-        if photo['photo_type'] == 'normal':
-            normal_count = photo['count']
-        else:
-            intimate_count = photo['count']
-    
-    bot.answer_callback_query(call.id, f"✅ Добавлено {photo_type} фото")
-    
-    # Показываем статистику
-    stats_text = (
-        f"📊 <b>Текущая анкета:</b>\n\n"
-        f"📸 Обычных фото: {normal_count}\n"
-        f"🔞 Интимных фото: {intimate_count}\n\n"
-    )
-    
-    if normal_count >= 1 and intimate_count >= 1:
-        # Все требования выполнены
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("📤 Отправить на проверку", callback_data=f"submit_{application_id}"))
-        stats_text += "✅ <b>Все требования выполнены!</b>\nМожно отправить анкету на проверку."
-    else:
-        keyboard = None
-        stats_text += "👇 <b>Продолжайте загружать фото</b>\nТребуется минимум 1 обычное и 1 интимное фото."
-    
-    try:
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=stats_text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-    except:
-        pass
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('submit_'))
-def submit_application_handler(call):
-    """Отправка анкеты на проверку"""
-    application_id = int(call.data.split('_')[1])
-    user_id = call.from_user.id
+def get_user_stats(user_id):
+    """Получение статистики пользователя"""
+    stats = db.fetchone("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN approved = 1 THEN 1 ELSE 0 END) as approved,
+            SUM(CASE WHEN approved = 0 THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN approved = -1 THEN 1 ELSE 0 END) as rejected
+        FROM submissions 
+        WHERE user_id = ?
+    """, (user_id,))
     
-    # Получаем данные анкеты
-    application = db.fetchone(
-        """SELECT a.*, u.username, u.first_name 
-           FROM applications a 
-           JOIN users u ON a.user_id = u.user_id 
-           WHERE a.id = ?""",
-        (application_id,)
-    )
-    
-    if not application:
-        bot.answer_callback_query(call.id, "❌ Анкета не найдена", show_alert=True)
-        return
-    
-    # Меняем статус анкеты на "на проверке"
-    db.execute("UPDATE applications SET status = 'pending' WHERE id = ?", (application_id,))
-    
-    # Получаем все фото анкеты
-    photos = db.fetchall(
-        "SELECT photo_type, file_id FROM application_photos WHERE application_id = ?",
-        (application_id,)
-    )
-    
-    # Отправляем админам
+    return stats or {'total': 0, 'approved': 0, 'pending': 0, 'rejected': 0}
+
+def can_user_access_sections(user_id):
+    """Проверка, может ли пользователь видеть разделы"""
+    status = get_user_status(user_id)
+    return status == 'active'
+
+def notify_admins_about_new_user(user_id, username, first_name, last_name):
+    """Уведомление админов о новом пользователе"""
     for admin_id in ADMIN_IDS:
         try:
-            # Информация об анкете
-            info_msg = (
-                f"📨 <b>НОВАЯ АНКЕТА НА ПРОВЕРКУ</b>\n\n"
-                f"👤 <b>Пользователь:</b>\n"
-                f"ID: <code>{application['user_id']}</code>\n"
-                f"Ник: @{application['username'] if application['username'] else 'нет'}\n"
-                f"Имя: {application['first_name']}\n\n"
-                f"📂 <b>Раздел:</b> {application['section']}\n"
-                f"📸 <b>Фото:</b> {len(photos)} шт.\n"
-                f"🕒 <b>Время:</b> {application['created_at'][:16]}\n\n"
-                f"👇 <b>Фото анкеты:</b>"
-            )
-            
-            bot.send_message(admin_id, info_msg, parse_mode="HTML")
-            
-            # Отправляем фото
-            for photo in photos:
-                caption = "📸 Обычное фото" if photo['photo_type'] == 'normal' else "🔞 Интимное фото"
-                bot.send_photo(admin_id, photo['file_id'], caption=caption)
-            
-            # Клавиатура модерации
             bot.send_message(
                 admin_id,
-                "📋 <b>Решение по анкете:</b>",
-                reply_markup=moderation_keyboard(application_id),
-                parse_mode="HTML"
+                f"🆕 *Новый пользователь ожидает одобрения!*\n\n"
+                f"👤 ID: `{user_id}`\n"
+                f"👤 Имя: {first_name} {last_name}\n"
+                f"📛 Ник: @{username if username else 'нет'}\n"
+                f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"📋 *Действия:*\n"
+                f"• Проверить профиль пользователя\n"
+                f"• Использовать /admin для управления"
             )
-            
         except Exception as e:
-            logger.error(f"Не удалось отправить админу {admin_id}: {e}")
-    
-    # Подтверждение пользователю
-    bot.answer_callback_query(call.id, "✅ Анкета отправлена на проверку")
-    
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=(
-            "✅ <b>Анкета отправлена на проверку!</b>\n\n"
-            "Администратор проверит вашу анкету. "
-            "Ожидайте решения.\n\n"
-            "📌 <b>Примечание:</b>\n"
-            "• При одобрении - полный доступ ко всем разделам\n"
-            "• При отклонении - удаление из группы\n\n"
-            "Вы получите уведомление о результате."
-        ),
-        parse_mode="HTML"
-    )
+            logger.error(f"Не удалось уведомить админа {admin_id}: {e}")
 
-# ========== МОДЕРАЦИЯ ==========
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('approve_', 'reject_')))
-def moderation_handler(call):
-    """Обработка модерации админом"""
-    if call.from_user.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "❌ Нет прав", show_alert=True)
-        return
-    
-    action = call.data.split('_')[0]  # approve или reject
-    application_id = int(call.data.split('_')[1])
-    
-    # Получаем данные анкеты
-    application = db.fetchone(
-        """SELECT a.*, u.user_id, u.username, u.first_name 
-           FROM applications a 
-           JOIN users u ON a.user_id = u.user_id 
-           WHERE a.id = ?""",
-        (application_id,)
+# --- Клавиатуры ---
+def section_kb():
+    """Клавиатура выбора раздела (только для активных пользователей)"""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("Пары", callback_data="sec_пары"),
+        InlineKeyboardButton("Будуар", callback_data="sec_будуар"),
+        InlineKeyboardButton("Гараж", callback_data="sec_гараж")
     )
+    return kb
+
+def admin_approve_kb(user_id):
+    """Клавиатура одобрения пользователя для админов"""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Одобрить", callback_data=f"admin_approve_{user_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_reject_{user_id}"),
+        InlineKeyboardButton("👁️ Просмотреть", callback_data=f"admin_view_{user_id}"),
+        InlineKeyboardButton("💬 Написать", callback_data=f"admin_msg_{user_id}")
+    )
+    return kb
+
+def submission_type_kb():
+    """Клавиатура выбора типа контента для анкеты"""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("📸 Обычные фото", callback_data="type_regular"),
+        InlineKeyboardButton("🔞 Интимные фото", callback_data="type_intimate"),
+        InlineKeyboardButton("✅ Готово", callback_data="type_done")
+    )
+    return kb
+
+def admin_main_kb():
+    """Главная клавиатура админа"""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+        InlineKeyboardButton("⏳ Ожидают", callback_data="admin_pending_users"),
+        InlineKeyboardButton("📨 Заявки", callback_data="admin_pending_subs"),
+        InlineKeyboardButton("👥 Активные", callback_data="admin_active_users")
+    )
+    return kb
+
+# --- Хендлеры бота ---
+@bot.message_handler(commands=["start", "help"])
+def start(message):
+    """Обработка команды /start"""
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name or ""
     
-    if not application:
-        bot.answer_callback_query(call.id, "❌ Анкета не найдена", show_alert=True)
+    # Обновляем информацию о пользователе
+    update_user_info(user_id, username, first_name, last_name)
+    
+    # Получаем статус
+    status = get_user_status(user_id)
+    
+    if status == 'banned':
+        bot.reply_to(
+            message,
+            "❌ *Вы заблокированы!*\n\n"
+            "Вы не можете использовать бота.\n"
+            "Обратитесь к администратору для разблокировки."
+        )
         return
     
-    user_id = application['user_id']
-    
-    if action == 'approve':
-        # ОДОБРЕНИЕ
-        db.execute(
-            "UPDATE applications SET status = 'approved', moderated_at = CURRENT_TIMESTAMP, moderator_id = ? WHERE id = ?",
-            (call.from_user.id, application_id)
+    elif status == 'pending':
+        # НОВЫЙ ПОЛЬЗОВАТЕЛЬ: ПОЛНАЯ БЛОКИРОВКА
+        welcome_text = (
+            "👋 *Привет! Добро пожаловать в группу.*\n\n"
+            "📋 *Процесс одобрения:*\n"
+            "1. ⏳ Вы находитесь в статусе ожидания\n"
+            "2. 📋 Администратор проверит ваш профиль\n"
+            "3. ✅ После одобрения вы получите полный доступ\n\n"
+            "⚠️ *Пока вы не можете:*\n"
+            "• Видеть разделы группы\n"
+            "• Отправлять контент\n"
+            "• Просматривать анкеты других\n\n"
+            "📊 *Ваш статус:* Ожидание одобрения\n"
+            "👨‍💼 *Администраторы уведомлены*\n\n"
+            "⏳ *Ожидайте решения...*"
         )
-        db.execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (user_id,))
         
-        # Уведомляем пользователя
-        try:
-            bot.send_message(
-                user_id,
-                "🎉 <b>ВАША АНКЕТА ОДОБРЕНА!</b>\n\n"
-                "✅ Администратор проверил и одобрил вашу анкету.\n\n"
-                "🎊 <b>Теперь у вас есть:</b>\n"
-                "• Полный доступ ко всем разделам группы\n"
-                "• Возможность просматривать анкеты других участников\n"
-                "• Полная свобода действий согласно правилам группы\n\n"
-                "Добро пожаловать в сообщество! 🎉",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
+        bot.reply_to(message, welcome_text)
         
-        bot.answer_callback_query(call.id, "✅ Анкета одобрена")
+        # Уведомляем админов о новом пользователе
+        notify_admins_about_new_user(user_id, username, first_name, last_name)
         
-        # Обновляем сообщение админу
-        try:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=(
-                    f"✅ <b>АНКЕТА ОДОБРЕНА</b>\n\n"
-                    f"👤 Пользователь: <code>{user_id}</code>\n"
-                    f"📛 Ник: @{application['username'] if application['username'] else 'нет'}\n"
-                    f"📂 Раздел: {application['section']}\n"
-                    f"👨‍💼 Модератор: {call.from_user.first_name}\n"
-                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-                    f"<i>Пользователь получил полный доступ ко всем разделам</i>"
-                ),
-                parse_mode="HTML"
-            )
-        except:
-            pass
+        logger.info(f"Новый пользователь {user_id} ожидает одобрения")
+        
+    elif status == 'active':
+        # АКТИВНЫЙ ПОЛЬЗОВАТЕЛЬ: ПОЛНЫЙ ДОСТУП
+        welcome_text = (
+            "👋 *С возвращением!*\n\n"
+            "✅ *Ваш статус:* Полный доступ\n\n"
+            "📋 *Доступные действия:*\n"
+            "1. 📂 Выбрать раздел для анкеты\n"
+            "2. 📸 Отправить обычные фото (1+)\n"
+            "3. 🔞 Отправить интимные фото (1+)\n"
+            "4. ⏳ Дождаться модерации\n\n"
+            "⚠️ *Важно:*\n"
+            f"• Лимит: 1 анкета в {RATE_LIMIT_MINUTES} минут\n"
+            "• Анкета должна содержать оба типа фото\n"
+            "• После одобрения анкеты - полный доступ ко всем разделам\n\n"
+            "👇 *Выберите раздел для анкеты:*"
+        )
+        
+        bot.reply_to(message, welcome_text, reply_markup=section_kb())
         
     else:
-        # ОТКЛОНЕНИЕ
-        db.execute(
-            "UPDATE applications SET status = 'rejected', moderated_at = CURRENT_TIMESTAMP, moderator_id = ? WHERE id = ?",
-            (call.from_user.id, application_id)
+        # Неизвестный статус
+        bot.reply_to(
+            message,
+            "❓ *Неизвестный статус.*\n\n"
+            "Обратитесь к администратору."
         )
-        db.execute("UPDATE users SET status = 'banned' WHERE user_id = ?", (user_id,))
-        
-        # Уведомляем пользователя
-        try:
-            bot.send_message(
-                user_id,
-                "🚫 <b>ВАША АНКЕТА ОТКЛОНЕНА</b>\n\n"
-                "❌ Администратор отклонил вашу анкету.\n\n"
-                "📌 <b>Последствия:</b>\n"
-                "• Вы удалены из группы\n"
-                "• Доступ к боту заблокирован\n"
-                "• Повторная подача анкеты невозможна\n\n"
-                "Ваш аккаунт добавлен в чёрный список.",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
-        
-        bot.answer_callback_query(call.id, "❌ Анкета отклонена")
-        
-        # Обновляем сообщение админу
-        try:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=(
-                    f"❌ <b>АНКЕТА ОТКЛОНЕНА</b>\n\n"
-                    f"👤 Пользователь: <code>{user_id}</code>\n"
-                    f"📛 Ник: @{application['username'] if application['username'] else 'нет'}\n"
-                    f"📂 Раздел: {application['section']}\n"
-                    f"👨‍💼 Модератор: {call.from_user.first_name}\n"
-                    f"🕒 Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-                    f"<i>Пользователь забанен и удалён из системы</i>"
-                ),
-                parse_mode="HTML"
-            )
-        except:
-            pass
 
-# ========== АДМИН КОМАНДЫ ==========
-@bot.message_handler(commands=['admin'])
-def admin_handler(message):
-    """Панель администратора"""
-    if message.from_user.id not in ADMIN_IDS:
-        return
+@bot.message_handler(commands=["status"])
+def status_command(message):
+    """Проверка статуса пользователя"""
+    user_id = message.from_user.id
     
-    # Статистика
-    total_users = db.fetchone("SELECT COUNT(*) as count FROM users")['count']
-    pending_apps = db.fetchone("SELECT COUNT(*) as count FROM applications WHERE status = 'pending'")['count']
-    approved_users = db.fetchone("SELECT COUNT(*) as count FROM users WHERE status = 'approved'")['count']
+    # Обновляем активность
+    db.execute("UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
     
-    response = (
-        f"👨‍💼 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-        f"📊 <b>Статистика:</b>\n"
-        f"• 👥 Всего пользователей: {total_users}\n"
-        f"• ✅ Одобренных: {approved_users}\n"
-        f"• ⏳ Ожидают проверки: {pending_apps}\n\n"
-        f"🛠 <b>Доступные команды:</b>\n"
-        f"/users - Список пользователей\n"
-        f"/pending - Анкеты на проверке\n"
-        f"/stats - Подробная статистика"
+    # Получаем информацию
+    user_data = db.fetchone(
+        "SELECT status, created_at FROM users WHERE user_id = ?",
+        (user_id,)
     )
     
-    bot.reply_to(message, response, parse_mode="HTML")
-
-# ========== ЗАПУСК ==========
-if __name__ == '__main__':
-    logger.info(f"🤖 Бот запускается...")
-    logger.info(f"👨‍💼 Админы: {ADMIN_IDS}")
+    if not user_data:
+        bot.reply_to(
+            message,
+            "❌ *Вы еще не начали работу с ботом.*\n\n"
+            "Используйте /start для начала работы."
+        )
+        return
     
+    status = user_data['status']
+    section = get_user_section(user_id)
+    stats = get_user_stats(user_id)
+    
+    # Определяем текстовое описание статуса
+    if status == 'pending':
+        status_text = "⏳ ОЖИДАНИЕ ОДОБРЕНИЯ"
+        status_desc = "*Вы ожидаете проверки администратором.*\n\nПосле одобрения вы сможете создавать анкеты и получить доступ к разделам."
+    elif status == 'active':
+        status_text = "✅ АКТИВЕН (ПОЛНЫЙ ДОСТУП)"
+        status_desc = "*У вас есть полный доступ ко всем разделам.*\n\nВы можете создавать анкеты и просматривать контент других участников."
+    elif status == 'banned':
+        status_text = "❌ ЗАБЛОКИРОВАН"
+        status_desc = "*Вы заблокированы и не можете использовать бота.*\n\nОбратитесь к администратору для разблокировки."
+    else:
+        status_text = "❓ НЕИЗВЕСТНЫЙ СТАТУС"
+        status_desc = "Обратитесь к администратору."
+    
+    response = (
+        f"📊 *Ваш статус*\n\n"
+        f"👤 *ID:* `{user_id}`\n"
+        f"📈 *Статус:* {status_text}\n"
+        f"📂 *Раздел:* {section if section else 'не выбран'}\n"
+        f"📅 *Зарегистрирован:* {user_data['created_at'][:10]}\n\n"
+        f"📨 *Статистика анкет:*\n"
+        f"• Всего: {stats['total']}\n"
+        f"• ✅ Одобрено: {stats['approved']}\n"
+        f"• ⏳ Ожидает: {stats['pending']}\n"
+        f"• ❌ Отклонено: {stats['rejected']}\n\n"
+        f"{status_desc}"
+    )
+    
+    # Добавляем кнопки в зависимости от статуса
+    if status == 'active':
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📂 Выбрать раздел", callback_data="choose_section"))
+        bot.reply_to(message, response, reply_markup=markup)
+    else:
+        bot.reply_to(message, response)
+
+@bot.message_handler(commands=["admin"])
+def admin_command(message):
+    """Админ-панель"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        bot.reply_to(message, "❌ У вас нет прав администратора.")
+        return
+    
+    # Получаем статистику
+    pending_users = db.fetchone("SELECT COUNT(*) as count FROM users WHERE status = 'pending'")['count']
+    active_users = db.fetchone("SELECT COUNT(*) as count FROM users WHERE status = 'active'")['count']
+    banned_users = db.fetchone("SELECT COUNT(*) as count FROM users WHERE status = 'banned'")['count']
+    
+    pending_subs = db.fetchone("SELECT COUNT(*) as count FROM submissions WHERE approved = 0")['count']
+    
+    response = (
+        f"👨‍💼 *Админ-панель*\n\n"
+        f"📊 *Статистика пользователей:*\n"
+        f"• ⏳ Ожидают: {pending_users}\n"
+        f"• ✅ Активных: {active_users}\n"
+        f"• ❌ Заблокированных: {banned_users}\n\n"
+        f"📨 *Статистика анкет:*\n"
+        f"• ⏳ Ожидают модерации: {pending_subs}\n\n"
+        f"🛠️ *Действия:*"
+    )
+    
+    bot.reply_to(message, response, reply_markup=admin_main_kb())
+
+# --- Обработчики callback-запросов ---
+user_sessions = {}  # Временное хранилище для сессий пользователей
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
+def section_handler(call):
+    """Обработка выбора раздела"""
     try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        user_id = call.from_user.id
+        
+        # Проверяем статус пользователя
+        status = get_user_status(user_id)
+        if status != 'active':
+            bot.answer_callback_query(call.id, "❌ У вас нет доступа к разделам!")
+            return
+        
+        if not call.data or "_" not in call.data:
+            bot.answer_callback_query(call.id, "❌ Ошибка выбора раздела")
+            return
+            
+        section_name = call.data.split("_", 1)[1]
+        
+        # Проверяем валидность раздела
+        valid_sections = ["пары", "будуар", "гараж"]
+        if section_name.lower() not in valid_sections:
+            bot.answer_callback_query(call.id, "❌ Неверный раздел")
+            return
+        
+        # Устанавливаем раздел
+        set_user_section(user_id, section_name)
+        
+        # Инициализируем сессию для создания анкеты
+        user_sessions[user_id] = {
+            'section': section_name,
+            'regular_photos': [],
+            'intimate_photos': [],
+            'step': 'waiting_type'  # waiting_type, receiving_regular, receiving_intimate
+        }
+        
+        bot.answer_callback_query(call.id, f"✅ Раздел {section_name} выбран!")
+        
+        # Обновляем сообщение
+        bot.edit_message_text(
+            f"✅ *Вы выбрали раздел: {section_name}*\n\n"
+            "📋 *Теперь создадим вашу анкету:*\n\n"
+            "1. 📸 *Обычные фото* (минимум 1)\n"
+            "   • Без посторонних лиц\n"
+            "   • Не интимные\n\n"
+            "2. 🔞 *Интимные фото* (минимум 1)\n"
+            "   • Откровенные фото\n\n"
+            "👇 *Начнем с обычных фото. Нажмите кнопку ниже:*",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=submission_type_kb()
+        )
+        
+        logger.info(f"Пользователь {user_id} начал создание анкеты в разделе {section_name}")
+        
     except Exception as e:
-        logger.error(f"Ошибка бота: {e}")
+        logger.error(f"Ошибка в section_handler: {e}")
+        bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("type_"))
+def submission_type_handler(call):
+    """Обработка выбора типа контента"""
+    try:
+        user_id = call.from_user.id
+        
+        if user_id not in user_sessions:
+            bot.answer_callback_query(call.id, "❌ Сессия устарела. Начните заново.")
+            return
+        
+        action = call.data.split("_")[1]
+        session = user_sessions[user_id]
+        
+        if action == 'regular':
+            session['step'] = 'receiving_regular'
+            bot.answer_callback_query(call.id, "📸 Отправьте обычные фото")
+            
+            bot.edit_message_text(
+                "📸 *Отправьте ОБЫЧНЫЕ ФОТО*\n\n"
+                "❌ *Запрещено:*\n"
+                "• Посторонние лица\n"
+                "• Интимный контент\n"
+                "• Низкое качество\n\n"
+                "✅ *Требования:*\n"
+                "• Минимум 1 фото\n"
+                "• Четкое изображение\n"
+                "• Соответствие разделу\n\n"
+                "📎 *Отправьте фото одним или несколькими сообщениями*\n"
+                "💾 *Когда закончите, нажмите кнопку ниже*",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("✅ Готово с обычными фото", callback_data="type_regular_done")
+                )
+            )
+            
+        elif action == 'intimate':
+            if len(session['regular_photos']) == 0:
+                bot.answer_callback_query(call.id, "❌ Сначала отправьте обычные фото!")
+                return
+            
+            session['step'] = 'receiving_intimate'
+            bot.answer_callback_query(call.id, "🔞 Отправьте интимные фото")
+            
+            bot.edit_message_text(
+                "🔞 *Отправьте ИНТИМНЫЕ ФОТО*\n\n"
+                "⚠️ *Внимание:*\n"
+                "• Только для совершеннолетних\n"
+                "• Контент 18+\n"
+                "• Откровенные фото\n\n"
+                "✅ *Требования:*\n"
+                "• Минимум 1 фото\n"
+                "• Четкое изображение\n"
+                "• Соответствие разделу\n\n"
+                "📎 *Отправьте фото одним или несколькими сообщениями*\n"
+                "💾 *Когда закончите, нажмите кнопку ниже*",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("✅ Готово с интимными фото", callback_data="type_intimate_done")
+                )
+            )
+            
+        elif action == 'regular_done':
+            if len(session['regular_photos']) == 0:
+                bot.answer_callback_query(call.id, "❌ Нужно отправить хотя бы 1 обычное фото!")
+                return
+            
+            # Переходим к интимным фото
+            session['step'] = 'receiving_intimate'
+            bot.answer_callback_query(call.id, "✅ Переходим к интимным фото")
+            
+            bot.edit_message_text(
+                f"✅ *Обычные фото сохранены: {len(session['regular_photos'])}*\n\n"
+                "👇 *Теперь отправьте интимные фото:*",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("🔞 Интимные фото", callback_data="type_intimate")
+                )
+            )
+            
+        elif action == 'intimate_done':
+            if len(session['intimate_photos']) == 0:
+                bot.answer_callback_query(call.id, "❌ Нужно отправить хотя бы 1 интимное фото!")
+                return
+            
+            # Завершаем создание анкеты
+            bot.answer_callback_query(call.id, "✅ Анкета готова!")
+            
+            # Сохраняем анкету в БД
+            save_submission(user_id, session)
+            
+            # Очищаем сессию
+            del user_sessions[user_id]
+            
+            bot.edit_message_text(
+                f"🎉 *Анкета создана и отправлена на модерацию!*\n\n"
+                f"📂 *Раздел:* {session['section']}\n"
+                f"📸 *Обычные фото:* {len(session['regular_photos'])}\n"
+                f"🔞 *Интимные фото:* {len(session['intimate_photos'])}\n\n"
+                f"⏳ *Ожидайте решения администратора.*\n\n"
+                f"📊 *После одобрения анкеты вы получите:*\n"
+                f"• ✅ Полный доступ ко всем разделам\n"
+                f"• 👁️ Возможность просматривать анкеты других\n"
+                f"• 💬 Доступ к общению во всех разделах\n\n"
+                f"_Вы получите уведомление о результате._",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+            
+        elif action == 'done':
+            # Проверяем, что есть оба типа фото
+            if len(session['regular_photos']) == 0 or len(session['intimate_photos']) == 0:
+                bot.answer_callback_query(call.id, "❌ Нужны оба типа фото!")
+                return
+            
+            # Завершаем создание анкеты
+            bot.answer_callback_query(call.id, "✅ Анкета готова!")
+            
+            # Сохраняем анкету в БД
+            save_submission(user_id, session)
+            
+            # Очищаем сессию
+            del user_sessions[user_id]
+            
+            bot.edit_message_text(
+                f"🎉 *Анкета создана и отправлена на модерацию!*\n\n"
+                f"📂 *Раздел:* {session['section']}\n"
+                f"📸 *Обычные фото:* {len(session['regular_photos'])}\n"
+                f"🔞 *Интимные фото:* {len(session['intimate_photos'])}\n\n"
+                f"⏳ *Ожидайте решения администратора.*\n\n"
+                f"_Вы получите уведомление о результате._",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка в submission_type_handler: {e}")
+        bot.answer_callback_query(call.id, "❌ Произошла ошибка", show_alert=True)
+
+def save_submission(user_id, session):
+    """Сохранение анкеты в БД"""
+    try:
+        # Сохраняем основную информацию об анкете
+        submission_id = db.execute(
+            """INSERT INTO submissions 
+               (user_id, section, media_type, file_ids, approved) 
+               VALUES (?, ?, 'mixed', '[]', 0)""",
+            (user_id, session['section']),
+            return_id=True
+        )
+        
+        if not submission_id:
+            logger.error(f"Не удалось сохранить анкету для пользователя {user_id}")
+            return False
+        
+        # Сохраняем обычные фото
+        for file_id in session['regular_photos']:
+            db.execute(
+                """INSERT INTO media_files 
+                   (submission_id, file_id, media_type, content_type) 
+                   VALUES (?, ?, 'photo', 'regular')""",
+                (submission_id, file_id)
+            )
+        
+        # Сохраняем интимные фото
+        for file_id in session['intimate_photos']:
+            db.execute(
+                """INSERT INTO media_files 
+                   (submission_id, file_id, media_type, content_type) 
+                   VALUES (?, ?, 'photo', 'intimate')""",
+                (submission_id, file_id)
+            )
+        
+        # Обновляем file_ids в основной таблице
+        all_files = session['regular_photos'] + session['intimate_photos']
+        db.execute(
+            "UPDATE submissions SET file_ids = ? WHERE id = ?",
+            (json.dumps(all_files), submission_id)
+        )
+        
+        # Уведомляем админов
+        notify_admins_about_submission(submission_id, user_id, session)
+        
+        logger.info(f"Анкета #{submission_id} сохранена для пользователя {user_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении анкеты: {e}")
+        return False
+
+def notify_admins_about_submission(submission_id, user_id, session):
+    """Уведомление админов о новой анкете"""
+    user_data = db.fetchone(
+        "SELECT username, first_name FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    
+    username = user_data['username'] if user_data and user_data['username'] else 'нет'
+    first_name = user_data['first_name'] if user_data else 'Неизвестно'
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            message = (
+                f"📨 *Новая анкета #{submission_id}*\n\n"
+                f"👤 *Пользователь:*\n"
+                f"ID: `{user_id}`\n"
+                f"Имя: {first_name}\n"
+                f"Ник: @{username}\n\n"
+                f"📂 *Раздел:* {session['section']}\n"
+                f"📸 *Обычные фото:* {len(session['regular_photos'])}\n"
+                f"🔞 *Интимные фото:* {len(session['intimate_photos'])}\n\n"
+                f"🛠️ *Модерация:*"
+            )
+            
+            # Отправляем одно обычное фото для примера
+            if session['regular_photos']:
+                bot.send_photo(admin_id, session['regular_photos'][0], caption=message)
+            else:
+                bot.send_message(admin_id, message)
+            
+            # Клавиатура для модерации
+            kb = InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                InlineKeyboardButton("✅ Одобрить анкету", callback_data=f"sub_approve_{submission_id}"),
+                InlineKeyboardButton("❌ Отклонить анкету", callback_data=f"sub_reject_{submission_id}"),
+                InlineKeyboardButton("👁️ Просмотреть все фото", callback_data=f"sub_view_{submission_id}"),
+                InlineKeyboardButton("👤 Инфо о пользователе", callback_data=f"sub_info_{user_id}")
+            )
+            
+            bot.send_message(admin_id, "📋 *Действия:*", reply_markup=kb)
+            
+        except Exception as e:
+            logger.error(f"Не удалось уведомить админа {admin_id}: {e}")
+
+# --- Обработка медиафайлов ---
+@bot.message_handler(content_types=["photo"])
+def photo_handler(message):
+    """Обработка фото"""
+    try:
+        user_id = message.from_user.id
+        
+        # Проверяем статус
+        status = get_user_status(user_id)
+        if status != 'active':
+            bot.reply_to(message, "❌ У вас нет доступа для отправки контента.")
+            return
+        
+        # Проверяем, есть ли активная сессия
+        if user_id not in user_sessions:
+            bot.reply_to(
+                message,
+                "❌ *Сначала выберите раздел для анкеты!*\n\n"
+                "Используйте /start для начала."
+            )
+            return
+        
+        session = user_sessions[user_id]
+        file_id = message.photo[-1].file_id
+        
+        # Добавляем фото в соответствующую категорию
+        if session['step'] == 'receiving_regular':
+            session['regular_photos'].append(file_id)
+            count = len(session['regular_photos'])
+            bot.reply_to(message, f"✅ Обычное фото #{count} сохранено")
+            
+        elif session['step'] == 'receiving_intimate':
+            session['intimate_photos'].append(file_id)
+            count = len(session['intimate_photos'])
+            bot.reply_to(message,
