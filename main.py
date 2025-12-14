@@ -168,3 +168,4 @@ def decision(call):
 
 # ================= ЗАПУСК =================
 bot.infinity_polling()
+
