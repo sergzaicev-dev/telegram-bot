@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-Telegram moderation bot с полной защитой от повторного вступления
+Telegram moderation bot с полной защитой от повторного вступления + анкеты + ОТЛАДКА
 """
 import os
 import sys
 import logging
 import threading
 import sqlite3
+import json
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from flask import Flask, request
 import signal
 import time
@@ -45,7 +46,7 @@ def init_db():
         conn = _conn()
         cur = conn.cursor()
         
-        # Основные таблицы (как в работающем коде)
+        # Основные таблицы
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -105,8 +106,8 @@ def init_db():
             admin_decision TEXT DEFAULT NULL,
             decided_by INTEGER,
             decided_at TIMESTAMP,
-            ban_history TEXT DEFAULT '[]', -- JSON массив дат банов
-            unban_history TEXT DEFAULT '[]', -- JSON массив дат разбанов
+            ban_history TEXT DEFAULT '[]',
+            unban_history TEXT DEFAULT '[]',
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         """)
@@ -143,7 +144,7 @@ def db_execute(query: str, params=(), fetchone=False, fetchall=False, return_id=
         finally:
             conn.close()
 
-# ---------- ФУНКЦИИ ДЛЯ ГРУППЫ (ПОЛНОЕ РЕШЕНИЕ) ----------
+# ---------- ФУНКЦИИ ДЛЯ ГРУППЫ ----------
 def update_group_status(user_id: int, in_group: bool, force_verification: bool = False):
     """Обновить статус пользователя в группе"""
     now = datetime.now().isoformat()
@@ -157,12 +158,12 @@ def update_group_status(user_id: int, in_group: bool, force_verification: bool =
             (user_id, in_group, last_seen_in_group, join_count, last_join_time, verification_required)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (user_id, 1 if in_group else 0, now, 1 if in_group else 0, now if in_group else None, 1))
+        logger.info(f"[GROUP] Создана запись для пользователя {user_id}, in_group={in_group}")
     else:
         if in_group and not tracking['in_group']:
             # Пользователь вступил в группу
             join_count = tracking['join_count'] + 1
             
-            # Если был забанен и разбанен - требуется верификация
             if force_verification:
                 verification_required = 1
             else:
@@ -175,6 +176,7 @@ def update_group_status(user_id: int, in_group: bool, force_verification: bool =
                     verification_required = ?
                 WHERE user_id = ?
             """, (now, join_count, now, verification_required, user_id))
+            logger.info(f"[GROUP] Пользователь {user_id} вступил, verification_required={verification_required}")
         elif not in_group and tracking['in_group']:
             # Пользователь вышел из группы
             db_execute("""
@@ -182,6 +184,7 @@ def update_group_status(user_id: int, in_group: bool, force_verification: bool =
                 SET in_group = 0 
                 WHERE user_id = ?
             """, (user_id,))
+            logger.info(f"[GROUP] Пользователь {user_id} вышел")
 
 def get_user_group_status(user_id: int) -> Dict[str, Any]:
     """Получить полный статус пользователя в группе"""
@@ -197,7 +200,11 @@ def get_user_group_status(user_id: int) -> Dict[str, Any]:
 
 def handle_group_join(user_id: int, chat_id: int = None):
     """Обработка вступления пользователя в группу - ПОЛНАЯ ПРОВЕРКА"""
+    logger.info(f"[DEBUG] ======= НАЧАЛО handle_group_join для user_id={user_id} =======")
+    
     user = db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    
+    logger.info(f"[DEBUG] Пользователь {user_id} в БД users: {user}")
     
     if not user:
         # Создаем запись пользователя
@@ -212,17 +219,25 @@ def handle_group_join(user_id: int, chat_id: int = None):
                 VALUES (?, ?, ?, ?, 'pending')
             """, (user_id, username, first_name, last_name))
             user = db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-        except:
+            logger.info(f"[DEBUG] Создан новый пользователь: {user}")
+        except Exception as e:
+            logger.error(f"[DEBUG] Ошибка при создании пользователя: {e}")
             user = {'user_id': user_id, 'first_name': 'Неизвестный', 'username': None, 'status': 'pending'}
     
     # Получаем статус в группе
     group_status = get_user_group_status(user_id)
+    logger.info(f"[DEBUG] Статус в группе для {user_id}: {group_status}")
     
     # КРИТИЧЕСКАЯ ПРОВЕРКА: если пользователь approved И ему не требуется верификация
+    logger.info(f"[DEBUG] Проверка условия: user['status']={user['status']}, group_status['verification_required']={group_status['verification_required']}")
+    
     if user['status'] == 'approved' and not group_status['verification_required']:
-        # Все ок, пользователь может остаться в группе
+        logger.info(f"[DEBUG] УСЛОВИЕ СРАБОТАЛО: пользователь approved и верификация не требуется. УВЕДОМЛЕНИЯ НЕ ОТПРАВЛЯЕМ!")
         update_group_status(user_id, True)
         return
+    
+    logger.info(f"[DEBUG] УСЛОВИЕ НЕ СРАБОТАЛО: user['status']={user['status']}, verification_required={group_status['verification_required']}")
+    logger.info(f"[DEBUG] Продолжаем обработку для отправки уведомлений админам...")
     
     # ВСЕ ОСТАЛЬНЫЕ СЛУЧАИ - требуют верификации
     update_group_status(user_id, True, force_verification=True)
@@ -237,8 +252,10 @@ def handle_group_join(user_id: int, chat_id: int = None):
         InlineKeyboardButton("❌ Запретить вход", callback_data=f"gdeny_{user_id}")
     )
     
+    admin_count = 0
     for aid in ADMIN_IDS:
         try:
+            logger.info(f"[DEBUG] Пытаюсь отправить уведомление админу {aid}")
             bot.send_message(
                 aid,
                 f"🔄 Пользователь вступил в группу:\n"
@@ -250,21 +267,30 @@ def handle_group_join(user_id: int, chat_id: int = None):
                 f"Выберите действие:",
                 reply_markup=kb
             )
+            admin_count += 1
+            logger.info(f"[DEBUG] Уведомление успешно отправлено админу {aid}")
         except Exception as e:
-            logger.debug("Не удалось уведомить админа: %s", e)
+            logger.error(f"[DEBUG] Не удалось уведомить админа {aid}: {e}")
+    
+    logger.info(f"[DEBUG] Отправлено уведомлений админам: {admin_count}/{len(ADMIN_IDS)}")
     
     # Если пользователь banned - пытаемся кикнуть
     if user['status'] == 'banned':
+        logger.info(f"[DEBUG] Пользователь {user_id} имеет статус 'banned', пытаюсь кикнуть...")
         try:
             if chat_id:
                 bot.ban_chat_member(chat_id, user_id)
                 time.sleep(1)
                 bot.unban_chat_member(chat_id, user_id)
-        except:
-            pass
+                logger.info(f"[DEBUG] Пользователь {user_id} забанен и разбанен")
+        except Exception as e:
+            logger.error(f"[DEBUG] Ошибка при кике пользователя {user_id}: {e}")
+    
+    logger.info(f"[DEBUG] ======= КОНЕЦ handle_group_join для user_id={user_id} =======")
 
 def handle_group_leave(user_id: int, chat_id: int = None):
     """Обработка выхода пользователя из группы"""
+    logger.info(f"[DEBUG] handle_group_leave для user_id={user_id}")
     update_group_status(user_id, False)
     
     user = db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -283,7 +309,7 @@ def handle_group_leave(user_id: int, chat_id: int = None):
         except Exception as e:
             logger.debug("Не удалось уведомить админа: %s", e)
 
-# ---------- ОСНОВНЫЕ ФУНКЦИИ (из работающего кода) ----------
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ АНКЕТ ----------
 def ensure_user(user_id: int, username: str = None, first_name: str = None, last_name: str = ""):
     existing = db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if existing:
@@ -300,8 +326,49 @@ def ensure_user(user_id: int, username: str = None, first_name: str = None, last
 def get_user(user_id: int):
     return db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
 
+def get_user_state(user_id: int):
+    return db_execute("SELECT * FROM user_state WHERE user_id = ?", (user_id,), fetchone=True)
+
+def update_user_state(user_id: int, **kwargs):
+    existing = get_user_state(user_id)
+    if existing:
+        set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+        values = list(kwargs.values()) + [user_id]
+        db_execute(f"UPDATE user_state SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?", values)
+    else:
+        columns = ["user_id"] + list(kwargs.keys())
+        placeholders = ["?"] * (len(kwargs) + 1)
+        values = [user_id] + list(kwargs.values())
+        db_execute(f"INSERT INTO user_state ({', '.join(columns)}) VALUES ({', '.join(placeholders)})", values)
+
+def create_application(user_id: int, section: str) -> int:
+    app_id = db_execute(
+        "INSERT INTO applications (user_id, section) VALUES (?, ?)",
+        (user_id, section),
+        return_id=True
+    )
+    update_user_state(user_id, current_app_id=app_id, awaiting_media_type="normal")
+    return app_id
+
+def get_application(app_id: int):
+    return db_execute("SELECT * FROM applications WHERE id = ?", (app_id,), fetchone=True)
+
+def get_application_media(app_id: int):
+    return db_execute("SELECT * FROM media WHERE application_id = ? ORDER BY kind, created_at", (app_id,), fetchall=True)
+
+def add_media_to_app(app_id: int, media_type: str, kind: str, file_id: str):
+    db_execute(
+        "INSERT INTO media (application_id, media_type, kind, file_id) VALUES (?, ?, ?, ?)",
+        (app_id, media_type, kind, file_id)
+    )
+
+def submit_application(app_id: int):
+    db_execute("UPDATE applications SET status = 1 WHERE id = ?", (app_id,))
+    app = get_application(app_id)
+    update_user_state(app['user_id'], current_app_id=None, awaiting_media_type=None)
+
 def notify_admins_new_application(app_id: int):
-    app = db_execute("SELECT * FROM applications WHERE id = ?", (app_id,), fetchone=True)
+    app = get_application(app_id)
     if not app:
         return
     uid = app['user_id']
@@ -322,25 +389,37 @@ def notify_admins_new_application(app_id: int):
         except:
             pass
 
+def notify_user_about_application(app_id: int, message: str):
+    app = get_application(app_id)
+    if app:
+        try:
+            bot.send_message(app['user_id'], message)
+        except:
+            pass
+
 # ---------- ОБРАБОТЧИКИ ГРУППЫ ----------
 @bot.message_handler(content_types=["new_chat_members"])
 def handle_new_chat_members(message):
     """Обработка новых участников группы"""
+    logger.info(f"[DEBUG] Получено событие new_chat_members в чате {message.chat.id}")
     for new_member in message.new_chat_members:
         if not new_member.is_bot:
-            logger.info(f"Новый участник: {new_member.id} в группе {message.chat.id}")
+            logger.info(f"[DEBUG] Обрабатываю нового участника: {new_member.id} ({new_member.first_name})")
             handle_group_join(new_member.id, message.chat.id)
 
 @bot.message_handler(content_types=["left_chat_member"])
 def handle_left_chat_member(message):
     """Обработка выхода участника из группы"""
+    logger.info(f"[DEBUG] Получено событие left_chat_member в чате {message.chat.id}")
     if not message.left_chat_member.is_bot:
-        logger.info(f"Участник вышел: {message.left_chat_member.id} из группы {message.chat.id}")
+        logger.info(f"[DEBUG] Обрабатываю выход участника: {message.left_chat_member.id}")
         handle_group_leave(message.left_chat_member.id, message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("gallow_", "gdeny_")))
 def handle_group_decision(call):
     """Обработка решений по группе"""
+    logger.info(f"[DEBUG] Получен колбэк: {call.data} от пользователя {call.from_user.id}")
+    
     if call.from_user.id not in ADMIN_IDS:
         bot.answer_callback_query(call.id, "Нет прав", show_alert=True)
         return
@@ -364,7 +443,6 @@ def handle_group_decision(call):
                 WHERE user_id = ?
             """, (call.from_user.id, now, user_id))
             
-            # Меняем статус пользователя на approved
             db_execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (user_id,))
             
             bot.answer_callback_query(call.id, "Вход разрешен (без верификации)")
@@ -389,7 +467,6 @@ def handle_group_decision(call):
             except:
                 pass
         
-        # Обновляем сообщение админа
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
@@ -409,7 +486,6 @@ def handle_group_decision(call):
             WHERE user_id = ?
         """, (call.from_user.id, now, user_id))
         
-        # Баним пользователя
         db_execute("UPDATE users SET status = 'banned' WHERE user_id = ?", (user_id,))
         
         bot.answer_callback_query(call.id, "Вход запрещен")
@@ -424,7 +500,6 @@ def handle_group_decision(call):
         except:
             pass
         
-        # Обновляем сообщение админа
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
@@ -434,7 +509,7 @@ def handle_group_decision(call):
         except:
             pass
 
-# ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ (из работающего кода) ----------
+# ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ АНКЕТ ----------
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     uid = message.from_user.id
@@ -448,7 +523,6 @@ def cmd_start(message):
     if message.chat.type in ['group', 'supergroup']:
         group_status = get_user_group_status(uid)
         
-        # Если пользователь в группе, но не прошел верификацию
         if group_status['in_group'] and group_status['verification_required']:
             if user['status'] == 'pending':
                 handle_group_join(uid, message.chat.id)
@@ -472,14 +546,287 @@ def cmd_start(message):
     kb.add(InlineKeyboardButton("📝 Создать анкету", callback_data="create_app"))
     bot.send_message(uid, "📝 Вы в режиме ожидания (pending).", reply_markup=kb)
 
-# [Остальные обработчики из работающего кода остаются БЕЗ ИЗМЕНЕНИЙ]
-# @bot.callback_query_handler(func=lambda call: call.data == "create_app")
-# @bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
-# @bot.callback_query_handler(func=lambda call: call.data.startswith(("add_normal_", "add_intimate_")))
-# @bot.message_handler(content_types=["photo", "video", "animation"])
-# @bot.callback_query_handler(func=lambda call: call.data.startswith("submit_app_"))
-# @bot.callback_query_handler(func=lambda call: call.data.startswith("reset_app_"))
-# @bot.callback_query_handler(func=lambda call: call.data.startswith(("appr_", "rej_", "fix_", "view_")))
+@bot.callback_query_handler(func=lambda call: call.data == "create_app")
+def callback_create_app(call):
+    uid = call.from_user.id
+    user = get_user(uid)
+    
+    if user['status'] == 'banned':
+        bot.answer_callback_query(call.id, "Вы заблокированы.", show_alert=True)
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("Парм", callback_data="sec_parm"),
+        InlineKeyboardButton("Будуар", callback_data="sec_buduar"),
+        InlineKeyboardButton("Гараж", callback_data="sec_garage"),
+        InlineKeyboardButton("Болталка", callback_data="sec_chat")
+    )
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="Выберите раздел для анкеты:",
+        reply_markup=kb
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
+def callback_select_section(call):
+    uid = call.from_user.id
+    section = call.data.replace("sec_", "")
+    
+    # Создаем новую анкету
+    app_id = create_application(uid, section)
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Обычные фото/видео", callback_data=f"add_normal_{app_id}"),
+        InlineKeyboardButton("➕ Интим фото/видео", callback_data=f"add_intimate_{app_id}")
+    )
+    kb.add(InlineKeyboardButton("✅ Отправить на модерацию", callback_data=f"submit_app_{app_id}"))
+    kb.add(InlineKeyboardButton("🔄 Начать заново", callback_data=f"reset_app_{app_id}"))
+    
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"📝 Создана анкета #{app_id} для раздела '{section}'\n\n"
+             f"Добавьте материалы:\n"
+             f"• Обычные фото/видео - ваши фото, видео, гифки\n"
+             f"• Интим фото/видео - контент 18+\n\n"
+             f"После добавления всех материалов нажмите 'Отправить на модерацию'.",
+        reply_markup=kb
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("add_normal_", "add_intimate_")))
+def callback_add_media_type(call):
+    app_id = int(call.data.split("_")[-1])
+    kind = "normal" if "normal" in call.data else "intimate"
+    
+    # Обновляем состояние пользователя
+    update_user_state(call.from_user.id, current_app_id=app_id, awaiting_media_type=kind)
+    
+    bot.answer_callback_query(
+        call.id,
+        f"Теперь отправьте фото, видео или GIF для {kind} части",
+        show_alert=True
+    )
+    
+    # Отправляем сообщение с инструкцией
+    bot.send_message(
+        call.from_user.id,
+        f"📤 Отправьте фото, видео или GIF для {'обычной' if kind == 'normal' else 'интимной'} части анкеты #{app_id}\n"
+        f"Можно отправить несколько файлов.\n"
+        f"Когда закончите, вернитесь в меню анкеты."
+    )
+
+@bot.message_handler(content_types=["photo", "video", "animation"])
+def handle_media(message):
+    uid = message.from_user.id
+    state = get_user_state(uid)
+    
+    if not state or not state['current_app_id'] or not state['awaiting_media_type']:
+        bot.reply_to(message, "Сначала выберите тип контента в меню анкеты.")
+        return
+    
+    app_id = state['current_app_id']
+    kind = state['awaiting_media_type']
+    
+    # Определяем тип медиа
+    if message.content_type == "photo":
+        file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.content_type == "video":
+        file_id = message.video.file_id
+        media_type = "video"
+    elif message.content_type == "animation":
+        file_id = message.animation.file_id
+        media_type = "animation"
+    else:
+        return
+    
+    # Сохраняем в БД
+    add_media_to_app(app_id, media_type, kind, file_id)
+    
+    bot.reply_to(message, f"✅ {media_type} добавлен в {kind} часть анкеты #{app_id}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("submit_app_"))
+def callback_submit_app(call):
+    app_id = int(call.data.split("_")[-1])
+    
+    # Проверяем, есть ли медиа в анкете
+    media = get_application_media(app_id)
+    if not media:
+        bot.answer_callback_query(call.id, "Добавьте хотя бы один файл перед отправкой.", show_alert=True)
+        return
+    
+    # Отправляем на модерацию
+    submit_application(app_id)
+    notify_admins_new_application(app_id)
+    
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"✅ Анкета #{app_id} отправлена на модерацию.\nОжидайте решения администратора."
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reset_app_"))
+def callback_reset_app(call):
+    app_id = int(call.data.split("_")[-1])
+    
+    # Удаляем анкету и все медиа
+    db_execute("DELETE FROM media WHERE application_id = ?", (app_id,))
+    db_execute("DELETE FROM applications WHERE id = ?", (app_id,))
+    
+    # Сбрасываем состояние пользователя
+    update_user_state(call.from_user.id, current_app_id=None, awaiting_media_type=None)
+    
+    bot.answer_callback_query(call.id, "Анкета удалена. Начните заново.", show_alert=True)
+    
+    # Возвращаем к выбору раздела
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("Парм", callback_data="sec_parm"),
+        InlineKeyboardButton("Будуар", callback_data="sec_buduar"),
+        InlineKeyboardButton("Гараж", callback_data="sec_garage"),
+        InlineKeyboardButton("Болталка", callback_data="sec_chat")
+    )
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="Выберите раздел для анкеты:",
+        reply_markup=kb
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("appr_", "rej_", "fix_", "view_")))
+def handle_moderation_decision(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "Нет прав", show_alert=True)
+        return
+    
+    action = call.data.split("_")[0]
+    app_id = int(call.data.split("_")[1])
+    
+    app = get_application(app_id)
+    if not app:
+        bot.answer_callback_query(call.id, "Анкета не найдена", show_alert=True)
+        return
+    
+    if action == "view":
+        # Просмотр анкеты
+        media = get_application_media(app_id)
+        if not media:
+            bot.answer_callback_query(call.id, "В анкете нет медиа", show_alert=True)
+            return
+        
+        # Отправляем первое медиа
+        first_media = media[0]
+        caption = f"Анкета #{app_id}\nРаздел: {app['section']}\nПользователь: {app['user_id']}\nМедиа: {len(media)} шт."
+        
+        if first_media['media_type'] == 'photo':
+            bot.send_photo(call.from_user.id, first_media['file_id'], caption=caption)
+        elif first_media['media_type'] == 'video':
+            bot.send_video(call.from_user.id, first_media['file_id'], caption=caption)
+        elif first_media['media_type'] == 'animation':
+            bot.send_animation(call.from_user.id, first_media['file_id'], caption=caption)
+        
+        # Отправляем остальные медиа если есть
+        for m in media[1:]:
+            if m['media_type'] == 'photo':
+                bot.send_photo(call.from_user.id, m['file_id'])
+            elif m['media_type'] == 'video':
+                bot.send_video(call.from_user.id, m['file_id'])
+            elif m['media_type'] == 'animation':
+                bot.send_animation(call.from_user.id, m['file_id'])
+        
+        bot.answer_callback_query(call.id, f"Отправлено {len(media)} медиа")
+        return
+    
+    # Обновляем статус анкеты
+    now = datetime.now().isoformat()
+    
+    if action == "appr":
+        db_execute(
+            "UPDATE applications SET status = 2, moderator_id = ?, moderated_at = ? WHERE id = ?",
+            (call.from_user.id, now, app_id)
+        )
+        db_execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (app['user_id'],))
+        
+        # Если пользователь в группе, снимаем требование верификации
+        group_status = get_user_group_status(app['user_id'])
+        if group_status['in_group']:
+            db_execute("UPDATE group_tracking SET verification_required = 0 WHERE user_id = ?", (app['user_id'],))
+        
+        notify_user_about_application(app_id, "✅ Ваша анкета одобрена! Доступ открыт.")
+        bot.answer_callback_query(call.id, "Анкета одобрена")
+        
+    elif action == "rej":
+        db_execute(
+            "UPDATE applications SET status = 3, moderator_id = ?, moderated_at = ? WHERE id = ?",
+            (call.from_user.id, now, app_id)
+        )
+        notify_user_about_application(app_id, "❌ Ваша анкета отклонена.")
+        bot.answer_callback_query(call.id, "Анкета отклонена")
+        
+    elif action == "fix":
+        db_execute(
+            "UPDATE applications SET status = 4, moderator_id = ?, moderated_at = ? WHERE id = ?",
+            (call.from_user.id, now, app_id)
+        )
+        notify_user_about_application(app_id, "✏️ Требуются правки в анкете. Свяжитесь с администратором.")
+        bot.answer_callback_query(call.id, "Запрошены правки")
+    
+    # Обновляем сообщение админа
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"{'✅' if action == 'appr' else '❌' if action == 'rej' else '✏️'} "
+                 f"Анкета #{app_id} {'одобрена' if action == 'appr' else 'отклонена' if action == 'rej' else 'требует правок'}"
+        )
+    except:
+        pass
+
+# ---------- ОТЛАДОЧНЫЕ КОМАНДЫ ----------
+@bot.message_handler(commands=["debug_user"])
+def debug_user_cmd(message):
+    """Отладочная команда для проверки статуса пользователя"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    try:
+        user_id = int(message.text.split()[1]) if len(message.text.split()) > 1 else message.from_user.id
+    except:
+        user_id = message.from_user.id
+    
+    user = get_user(user_id)
+    group_status = get_user_group_status(user_id)
+    
+    response = f"🔍 ДЕБАГ пользователя {user_id}:\n"
+    response += f"В БД users: {user}\n"
+    response += f"В БД group_tracking: {group_status}\n"
+    
+    bot.reply_to(message, response)
+
+@bot.message_handler(commands=["reset_user"])
+def reset_user_cmd(message):
+    """Сбросить пользователя в БД для тестирования"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    try:
+        user_id = int(message.text.split()[1])
+    except:
+        bot.reply_to(message, "Использование: /reset_user USER_ID")
+        return
+    
+    db_execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    db_execute("DELETE FROM group_tracking WHERE user_id = ?", (user_id,))
+    
+    bot.reply_to(message, f"✅ Пользователь {user_id} полностью сброшен в БД")
+
+@bot.message_handler(commands=["ping"])
+def ping_cmd(message):
+    """Проверка работы бота"""
+    bot.reply_to(message, "🏓 Бот работает!")
 
 # ---------- Flask и запуск ----------
 app = Flask(__name__)
@@ -502,7 +849,7 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    logger.info("Запуск бота с полной защитой группы...")
+    logger.info("Запуск бота с полной защитой группы и анкетами...")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except Exception as e:
