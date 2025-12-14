@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")  # Меняем на HTML или убираем parse_mode
 
 # ---------- БАЗА ДАННЫХ ----------
 DB_PATH = os.getenv("DB_PATH", "moderation_bot.db")
@@ -242,7 +242,17 @@ def handle_group_join(user_id: int, chat_id: int = None):
     # ВСЕ ОСТАЛЬНЫЕ СЛУЧАИ - требуют верификации
     update_group_status(user_id, True, force_verification=True)
     
-    # Отправляем уведомление админам
+    # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ АДМИНАМ (ИСПРАВЛЕНО - без Markdown)
+    message_text = (
+        f"🔄 Пользователь вступил в группу:\n"
+        f"ID: {user_id}\n"
+        f"Имя: {user['first_name'] or '-'}\n"
+        f"Ник: @{user['username'] or '-'}\n"
+        f"Статус: {user['status']}\n"
+        f"Вступлений: {group_status.get('join_count', 1)}\n\n"
+        f"Выберите действие:"
+    )
+    
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Разрешить (без верификации)", callback_data=f"gallow_noverify_{user_id}"),
@@ -258,14 +268,9 @@ def handle_group_join(user_id: int, chat_id: int = None):
             logger.info(f"[DEBUG] Пытаюсь отправить уведомление админу {aid}")
             bot.send_message(
                 aid,
-                f"🔄 Пользователь вступил в группу:\n"
-                f"ID: `{user_id}`\n"
-                f"Имя: {user['first_name'] or '-'}\n"
-                f"Ник: @{user['username'] or '-'}\n"
-                f"Статус: {user['status']}\n"
-                f"Вступлений: {group_status.get('join_count', 1)}\n\n"
-                f"Выберите действие:",
-                reply_markup=kb
+                message_text,
+                reply_markup=kb,
+                parse_mode=None  # ОТКЛЮЧАЕМ Markdown
             )
             admin_count += 1
             logger.info(f"[DEBUG] Уведомление успешно отправлено админу {aid}")
@@ -297,17 +302,23 @@ def handle_group_leave(user_id: int, chat_id: int = None):
     if not user:
         user = {'first_name': 'Неизвестный', 'username': None}
     
+    # ИСПРАВЛЕНО - без Markdown
+    message_text = (
+        f"⚠️ Пользователь вышел из группы:\n"
+        f"ID: {user_id}\n"
+        f"Имя: {user['first_name'] or '-'}\n"
+        f"Ник: @{user['username'] or '-'}"
+    )
+    
     for aid in ADMIN_IDS:
         try:
             bot.send_message(
                 aid,
-                f"⚠️ Пользователь вышел из группы:\n"
-                f"ID: `{user_id}`\n"
-                f"Имя: {user['first_name'] or '-'}\n"
-                f"Ник: @{user['username'] or '-'}"
+                message_text,
+                parse_mode=None  # ОТКЛЮЧАЕМ Markdown
             )
         except Exception as e:
-            logger.debug("Не удалось уведомить админа: %s", e)
+            logger.debug(f"Не удалось уведомить админа: {e}")
 
 # ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ АНКЕТ ----------
 def ensure_user(user_id: int, username: str = None, first_name: str = None, last_name: str = ""):
@@ -373,7 +384,14 @@ def notify_admins_new_application(app_id: int):
         return
     uid = app['user_id']
     user = get_user(uid)
-    text = f"📨 Новая анкета #{app_id}\nПользователь: `{uid}` ({user['first_name'] or '-'}) @{user['username'] or '-'}\nРаздел: {app['section']}\n"
+    
+    # ИСПРАВЛЕНО - без Markdown
+    text = (
+        f"📨 Новая анкета #{app_id}\n"
+        f"Пользователь: {uid} ({user['first_name'] or '-'}) @{user['username'] or '-'}\n"
+        f"Раздел: {app['section']}\n"
+    )
+    
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Одобрить", callback_data=f"appr_{app_id}"),
@@ -383,19 +401,20 @@ def notify_admins_new_application(app_id: int):
         InlineKeyboardButton("✏️ Запросить правки", callback_data=f"fix_{app_id}"),
         InlineKeyboardButton("👁️ Просмотреть", callback_data=f"view_{app_id}")
     )
+    
     for aid in ADMIN_IDS:
         try:
-            bot.send_message(aid, text, reply_markup=kb)
-        except:
-            pass
+            bot.send_message(aid, text, reply_markup=kb, parse_mode=None)
+        except Exception as e:
+            logger.error(f"Ошибка отправки админу {aid}: {e}")
 
 def notify_user_about_application(app_id: int, message: str):
     app = get_application(app_id)
     if app:
         try:
-            bot.send_message(app['user_id'], message)
-        except:
-            pass
+            bot.send_message(app['user_id'], message, parse_mode=None)
+        except Exception as e:
+            logger.error(f"Ошибка отправки пользователю {app['user_id']}: {e}")
 
 # ---------- ОБРАБОТЧИКИ ГРУППЫ ----------
 @bot.message_handler(content_types=["new_chat_members"])
@@ -447,7 +466,7 @@ def handle_group_decision(call):
             
             bot.answer_callback_query(call.id, "Вход разрешен (без верификации)")
             try:
-                bot.send_message(user_id, "✅ Вам разрешен вход в группу. Верификация не требуется.")
+                bot.send_message(user_id, "✅ Вам разрешен вход в группу. Верификация не требуется.", parse_mode=None)
             except:
                 pass
             
@@ -463,7 +482,7 @@ def handle_group_decision(call):
             
             bot.answer_callback_query(call.id, "Требуется верификация")
             try:
-                bot.send_message(user_id, "📝 Для доступа к группе требуется пройти верификацию. Напишите /start")
+                bot.send_message(user_id, "📝 Для доступа к группе требуется пройти верификацию. Напишите /start", parse_mode=None)
             except:
                 pass
         
@@ -471,7 +490,8 @@ def handle_group_decision(call):
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=f"✅ Решение принято для пользователя {user_id}"
+                text=f"✅ Решение принято для пользователя {user_id}",
+                parse_mode=None
             )
         except:
             pass
@@ -504,7 +524,8 @@ def handle_group_decision(call):
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=f"❌ Вход запрещен для {user_id}"
+                text=f"❌ Вход запрещен для {user_id}",
+                parse_mode=None
             )
         except:
             pass
@@ -529,22 +550,23 @@ def cmd_start(message):
                 bot.send_message(uid, 
                     "⚠️ Вы в группе, но не прошли верификацию.\n"
                     "Администраторы получили уведомление.\n"
-                    "Ожидайте решения."
+                    "Ожидайте решения.",
+                    parse_mode=None
                 )
                 return
     
     if user['status'] == 'banned':
-        bot.send_message(uid, "🚫 Вы заблокированы.")
+        bot.send_message(uid, "🚫 Вы заблокированы.", parse_mode=None)
         return
     
     if user['status'] == 'approved':
-        bot.send_message(uid, "✅ Доступ открыт.")
+        bot.send_message(uid, "✅ Доступ открыт.", parse_mode=None)
         return
     
     # Показываем интерфейс для создания анкеты
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📝 Создать анкету", callback_data="create_app"))
-    bot.send_message(uid, "📝 Вы в режиме ожидания (pending).", reply_markup=kb)
+    bot.send_message(uid, "📝 Вы в режиме ожидания (pending).", reply_markup=kb, parse_mode=None)
 
 @bot.callback_query_handler(func=lambda call: call.data == "create_app")
 def callback_create_app(call):
@@ -566,7 +588,8 @@ def callback_create_app(call):
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="Выберите раздел для анкеты:",
-        reply_markup=kb
+        reply_markup=kb,
+        parse_mode=None
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
@@ -593,7 +616,8 @@ def callback_select_section(call):
              f"• Обычные фото/видео - ваши фото, видео, гифки\n"
              f"• Интим фото/видео - контент 18+\n\n"
              f"После добавления всех материалов нажмите 'Отправить на модерацию'.",
-        reply_markup=kb
+        reply_markup=kb,
+        parse_mode=None
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("add_normal_", "add_intimate_")))
@@ -615,7 +639,8 @@ def callback_add_media_type(call):
         call.from_user.id,
         f"📤 Отправьте фото, видео или GIF для {'обычной' if kind == 'normal' else 'интимной'} части анкеты #{app_id}\n"
         f"Можно отправить несколько файлов.\n"
-        f"Когда закончите, вернитесь в меню анкеты."
+        f"Когда закончите, вернитесь в меню анкеты.",
+        parse_mode=None
     )
 
 @bot.message_handler(content_types=["photo", "video", "animation"])
@@ -624,7 +649,7 @@ def handle_media(message):
     state = get_user_state(uid)
     
     if not state or not state['current_app_id'] or not state['awaiting_media_type']:
-        bot.reply_to(message, "Сначала выберите тип контента в меню анкеты.")
+        bot.reply_to(message, "Сначала выберите тип контента в меню анкеты.", parse_mode=None)
         return
     
     app_id = state['current_app_id']
@@ -646,7 +671,7 @@ def handle_media(message):
     # Сохраняем в БД
     add_media_to_app(app_id, media_type, kind, file_id)
     
-    bot.reply_to(message, f"✅ {media_type} добавлен в {kind} часть анкеты #{app_id}")
+    bot.reply_to(message, f"✅ {media_type} добавлен в {kind} часть анкеты #{app_id}", parse_mode=None)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("submit_app_"))
 def callback_submit_app(call):
@@ -665,7 +690,8 @@ def callback_submit_app(call):
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
-        text=f"✅ Анкета #{app_id} отправлена на модерацию.\nОжидайте решения администратора."
+        text=f"✅ Анкета #{app_id} отправлена на модерацию.\nОжидайте решения администратора.",
+        parse_mode=None
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reset_app_"))
@@ -693,7 +719,8 @@ def callback_reset_app(call):
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="Выберите раздел для анкеты:",
-        reply_markup=kb
+        reply_markup=kb,
+        parse_mode=None
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("appr_", "rej_", "fix_", "view_")))
@@ -722,20 +749,20 @@ def handle_moderation_decision(call):
         caption = f"Анкета #{app_id}\nРаздел: {app['section']}\nПользователь: {app['user_id']}\nМедиа: {len(media)} шт."
         
         if first_media['media_type'] == 'photo':
-            bot.send_photo(call.from_user.id, first_media['file_id'], caption=caption)
+            bot.send_photo(call.from_user.id, first_media['file_id'], caption=caption, parse_mode=None)
         elif first_media['media_type'] == 'video':
-            bot.send_video(call.from_user.id, first_media['file_id'], caption=caption)
+            bot.send_video(call.from_user.id, first_media['file_id'], caption=caption, parse_mode=None)
         elif first_media['media_type'] == 'animation':
-            bot.send_animation(call.from_user.id, first_media['file_id'], caption=caption)
+            bot.send_animation(call.from_user.id, first_media['file_id'], caption=caption, parse_mode=None)
         
         # Отправляем остальные медиа если есть
         for m in media[1:]:
             if m['media_type'] == 'photo':
-                bot.send_photo(call.from_user.id, m['file_id'])
+                bot.send_photo(call.from_user.id, m['file_id'], parse_mode=None)
             elif m['media_type'] == 'video':
-                bot.send_video(call.from_user.id, m['file_id'])
+                bot.send_video(call.from_user.id, m['file_id'], parse_mode=None)
             elif m['media_type'] == 'animation':
-                bot.send_animation(call.from_user.id, m['file_id'])
+                bot.send_animation(call.from_user.id, m['file_id'], parse_mode=None)
         
         bot.answer_callback_query(call.id, f"Отправлено {len(media)} медиа")
         return
@@ -780,7 +807,8 @@ def handle_moderation_decision(call):
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             text=f"{'✅' if action == 'appr' else '❌' if action == 'rej' else '✏️'} "
-                 f"Анкета #{app_id} {'одобрена' if action == 'appr' else 'отклонена' if action == 'rej' else 'требует правок'}"
+                 f"Анкета #{app_id} {'одобрена' if action == 'appr' else 'отклонена' if action == 'rej' else 'требует правок'}",
+            parse_mode=None
         )
     except:
         pass
@@ -804,7 +832,7 @@ def debug_user_cmd(message):
     response += f"В БД users: {user}\n"
     response += f"В БД group_tracking: {group_status}\n"
     
-    bot.reply_to(message, response)
+    bot.reply_to(message, response, parse_mode=None)
 
 @bot.message_handler(commands=["reset_user"])
 def reset_user_cmd(message):
@@ -815,18 +843,18 @@ def reset_user_cmd(message):
     try:
         user_id = int(message.text.split()[1])
     except:
-        bot.reply_to(message, "Использование: /reset_user USER_ID")
+        bot.reply_to(message, "Использование: /reset_user USER_ID", parse_mode=None)
         return
     
     db_execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     db_execute("DELETE FROM group_tracking WHERE user_id = ?", (user_id,))
     
-    bot.reply_to(message, f"✅ Пользователь {user_id} полностью сброшен в БД")
+    bot.reply_to(message, f"✅ Пользователь {user_id} полностью сброшен в БД", parse_mode=None)
 
 @bot.message_handler(commands=["ping"])
 def ping_cmd(message):
     """Проверка работы бота"""
-    bot.reply_to(message, "🏓 Бот работает!")
+    bot.reply_to(message, "🏓 Бот работает!", parse_mode=None)
 
 # ---------- Flask и запуск ----------
 app = Flask(__name__)
@@ -849,7 +877,7 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    logger.info("Запуск бота с полной защитой группы и анкетами...")
+    logger.info("Запуск бота с исправлениями Markdown...")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except Exception as e:
