@@ -1,18 +1,127 @@
 import telebot
 import sqlite3
 import logging
+import os
+import sys
+import atexit
+import signal
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from typing import Optional, Tuple
+
+# ================= БЛОКИРОВКА ДУБЛИРУЮЩЕГО ЗАПУСКА =================
+def check_single_instance():
+    """
+    Проверка, что бот запущен только в одном экземпляре.
+    Создает lock-файл и удаляет его при корректном завершении.
+    """
+    # Используем уникальное имя файла на основе токена бота
+    lock_file = "/tmp/telegram_bot.lock"
+    
+    # Проверяем, существует ли lock-файл
+    if os.path.exists(lock_file):
+        print("❌ ОШИБКА: Бот уже запущен в другом процессе!")
+        print("   Убедитесь, что:")
+        print("   1. Нет других запущенных экземпляров этого бота")
+        print("   2. Предыдущий процесс был корректно завершен")
+        print("   3. На других хостингах/компьютерах не запущен тот же бот")
+        
+        # Пытаемся прочитать PID из lock-файла
+        try:
+            with open(lock_file, "r") as f:
+                old_pid = f.read().strip()
+                print(f"   Обнаружен процесс с PID: {old_pid}")
+        except:
+            pass
+            
+        sys.exit(1)  # Завершаем процесс с ошибкой
+    
+    # Создаем новый lock-файл
+    try:
+        with open(lock_file, "w") as f:
+            f.write(str(os.getpid()))  # Записываем текущий PID
+        print(f"✅ Lock-файл создан: {lock_file}")
+    except Exception as e:
+        print(f"⚠️  Не удалось создать lock-файл: {e}")
+        # Продолжаем выполнение, но предупреждаем
+
+# Функция для удаления lock-файла при завершении
+def cleanup_lock_file():
+    """Удаляет lock-файл при корректном завершении программы"""
+    lock_file = "/tmp/telegram_bot.lock"
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+            print(f"✅ Lock-файл удален: {lock_file}")
+        except Exception as e:
+            print(f"⚠️  Не удалось удалить lock-файл: {e}")
+
+# Регистрируем функцию очистки
+atexit.register(cleanup_lock_file)
+
+# Обработчик сигналов для корректного завершения
+def signal_handler(signum, frame):
+    """Обработчик сигналов для корректного завершения"""
+    print(f"\n⚠️  Получен сигнал {signum}, завершаем работу...")
+    cleanup_lock_file()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Сигнал завершения
+
+# Проверяем одиночный запуск ДО всех остальных действий
+check_single_instance()
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = "8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI"
 ADMIN_ID = 5064426902
 
 # Настройка логирования для отслеживания ошибок
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+# ================= ПРОВЕРКА СОЕДИНЕНИЯ С TELEGRAM API =================
+def check_telegram_connection():
+    """Проверка подключения к Telegram API и отсутствия конфликтов"""
+    try:
+        print("🔍 Проверка подключения к Telegram API...")
+        
+        # Пытаемся получить информацию о боте
+        bot_info = bot.get_me()
+        print(f"✅ Бот подключен: @{bot_info.username} (ID: {bot_info.id})")
+        
+        # Проверяем, нет ли активных сессий getUpdates
+        try:
+            # Пробуем получить updates с offset=-1 для проверки
+            bot.get_updates(offset=-1, timeout=1)
+            print("✅ API доступно, конфликтов не обнаружено")
+        except Exception as api_error:
+            if "409" in str(api_error):
+                print("❌ ОБНАРУЖЕН КОНФЛИКТ: Другой экземпляр бота уже запущен!")
+                print("   Решение:")
+                print("   1. Приостановите службу на Render (если развернуто там)")
+                print("   2. Остановите локально запущенный бот")
+                print("   3. Подождите 30 секунд и попробуйте снова")
+                return False
+            else:
+                print(f"⚠️  Предупреждение при проверке API: {api_error}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Ошибка подключения к Telegram API: {e}")
+        print("   Проверьте:")
+        print("   1. Корректность токена бота")
+        print("   2. Доступность Telegram API из вашей сети")
+        print("   3. Не истек ли срок действия токена")
+        return False
 
 # ================= БАЗА ДАННЫХ =================
 def init_db():
@@ -410,30 +519,76 @@ def handle_admin_decision(call):
 # ================= ЗАПУСК БОТА =================
 def main():
     """Основная функция запуска бота"""
-    logger.info("Бот запускается...")
+    print("=" * 50)
+    print("🚀 ЗАПУСК TELEGRAM БОТА")
+    print("=" * 50)
     
     try:
-        # Проверка подключения к базе данных
+        # 1. Проверка одиночного запуска (уже выполнена в начале)
+        print("✅ Проверка одиночного экземпляра пройдена")
+        
+        # 2. Проверка подключения к Telegram API
+        if not check_telegram_connection():
+            print("❌ Не удалось подключиться к Telegram API")
+            cleanup_lock_file()
+            sys.exit(1)
+        
+        # 3. Проверка базы данных
         cursor.execute("SELECT 1")
-        logger.info("База данных подключена успешно")
+        print("✅ База данных подключена")
         
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        # 4. Запуск бота с явным логированием
+        print("\n" + "=" * 50)
+        print("🤖 БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ")
+        print("=" * 50)
+        print("Нажмите Ctrl+C для остановки\n")
         
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка базы данных: {e}")
+        # Запуск polling с обработкой ошибок
+        bot.infinity_polling(
+            timeout=60,
+            long_polling_timeout=30,
+            logger_level=logging.INFO
+        )
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Получен сигнал прерывания (Ctrl+C)")
+        print("Завершаем работу бота...")
+        
     except telebot.apihelper.ApiTelegramException as e:
         if "409" in str(e):
-            logger.error("Конфликт: уже запущен другой экземпляр бота!")
-            print("⚠️  ОШИБКА 409: Убедитесь, что бот запущен только в одном месте!")
+            print("\n❌ КРИТИЧЕСКАЯ ОШИБКА: Обнаружен конфликт 409!")
+            print("Возможные причины:")
+            print("1. Другой экземпляр бота запущен после проверки")
+            print("2. Предыдущий процесс не завершился корректно")
+            print("3. Токен используется в другом месте")
+            print("\nРешение:")
+            print("1. Приостановите службу на Render")
+            print("2. Подождите 60 секунд")
+            print("3. Перезапустите бота")
         else:
-            logger.error(f"Ошибка Telegram API: {e}")
+            print(f"\n❌ Ошибка Telegram API: {e}")
+            
+    except sqlite3.Error as e:
+        print(f"\n❌ Ошибка базы данных: {e}")
+        
     except Exception as e:
-        logger.error(f"Неожиданная ошибка: {e}")
+        print(f"\n❌ Неожиданная ошибка: {e}")
+        
     finally:
-        conn.close()
-        logger.info("Бот остановлен")
+        # Корректное завершение
+        print("\n" + "=" * 50)
+        print("🛑 ЗАВЕРШЕНИЕ РАБОТЫ БОТА")
+        print("=" * 50)
+        
+        # Закрытие соединений
+        try:
+            conn.close()
+            print("✅ Соединение с базой данных закрыто")
+        except:
+            pass
+            
+        # Удаление lock-файла (автоматически через atexit)
+        sys.exit(0)
 
 if __name__ == "__main__":
-    # Важно: проверяем, что бот запускается только один раз
-    print("Запуск Telegram бота...")
     main()
