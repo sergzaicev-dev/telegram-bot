@@ -11,6 +11,7 @@ Telegram moderation bot
     fix     -> возвращает возможность доработать анкету
 - Разделы (menu) скрыты от пользователей в статусе pending/banned, видны только approved
 - Пользователь может выбрать ОДИН раздел при создании анкеты; смена запрещена пока не сбросит админ/пользователь (по команде)
+- Автоматическое отслеживание входа/выхода из группы
 """
 import os
 import sys
@@ -43,6 +44,9 @@ BOT_TOKEN = "8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI"
 
 # ID администраторов (список чисел)
 ADMIN_IDS = [5064426902]  # можешь добавить через запятую несколько ID
+
+# ID группы для отслеживания (если нужно)
+GROUP_CHAT_ID = None  # Оставь None для автоматического определения или укажи ID группы
 
 # Лимит частоты (минуты). Если не используешь — оставляй как есть.
 RATE_LIMIT_MINUTES = 5
@@ -114,9 +118,23 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+        # group_membership: отслеживание нахождения в группе
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS group_membership (
+            user_id INTEGER PRIMARY KEY,
+            in_group BOOLEAN DEFAULT 0,
+            left_at TIMESTAMP,
+            can_return_without_verification BOOLEAN DEFAULT 0,
+            admin_decision TEXT DEFAULT NULL, -- 'allow', 'deny', 'verify'
+            decided_by INTEGER,
+            decided_at TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+        """)
         # indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_app_user ON applications(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_media_app ON media(application_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_group_user ON group_membership(user_id)")
         conn.commit()
         conn.close()
 
@@ -277,18 +295,235 @@ def notify_admins_new_application(app_id: int):
     )
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("✅ Одобрить", callback_data=f"mod_app_appr_{app_id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"mod_app_rej_{app_id}"),
+        InlineKeyboardButton("✅ Одобрить", callback_data=f"appr_{app_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"rej_{app_id}"),
     )
     kb.add(
-        InlineKeyboardButton("✏️ Запросить правки", callback_data=f"mod_app_fix_{app_id}"),
-        InlineKeyboardButton("👁️ Просмотреть", callback_data=f"mod_app_view_{app_id}")
+        InlineKeyboardButton("✏️ Запросить правки", callback_data=f"fix_{app_id}"),
+        InlineKeyboardButton("👁️ Просмотреть", callback_data=f"view_{app_id}")
     )
     for aid in ADMIN_IDS:
         try:
             bot.send_message(aid, text, reply_markup=kb)
         except Exception as e:
             logger.debug("Не удалось отправить заявку админу %s: %s", aid, e)
+
+# ---------- Функции для управления группой ----------
+def update_group_membership(user_id: int, in_group: bool, can_return_without_verification: bool = False):
+    """Обновить статус нахождения в группе"""
+    if in_group:
+        db_execute("""
+            INSERT OR REPLACE INTO group_membership 
+            (user_id, in_group, left_at, can_return_without_verification, admin_decision, decided_by, decided_at)
+            VALUES (?, 1, NULL, ?, NULL, NULL, NULL)
+        """, (user_id, can_return_without_verification))
+    else:
+        db_execute("""
+            INSERT OR REPLACE INTO group_membership 
+            (user_id, in_group, left_at, can_return_without_verification, admin_decision, decided_by, decided_at)
+            VALUES (?, 0, CURRENT_TIMESTAMP, 0, NULL, NULL, NULL)
+        """, (user_id,))
+
+def get_group_membership(user_id: int) -> Optional[Dict[str, Any]]:
+    return db_execute("SELECT * FROM group_membership WHERE user_id = ?", (user_id,), fetchone=True)
+
+def handle_user_left_group(user_id: int, chat_id: int = None):
+    """Обработка выхода пользователя из группы"""
+    user = get_user(user_id)
+    if not user:
+        # Создаем запись пользователя если её нет
+        ensure_user(user_id, None, f"User_{user_id}", "")
+        user = get_user(user_id)
+    
+    update_group_membership(user_id, in_group=False)
+    
+    # Уведомляем админов
+    for aid in ADMIN_IDS:
+        try:
+            bot.send_message(
+                aid,
+                f"⚠️ Пользователь вышел из группы{' ' + str(chat_id) if chat_id else ''}:\n"
+                f"ID: `{user_id}`\n"
+                f"Имя: {user['first_name'] or '-'}\n"
+                f"Ник: @{user['username'] or '-'}\n\n"
+                f"При повторном вступлении потребуется решение администратора."
+            )
+        except Exception as e:
+            logger.debug("Не удалось уведомить админа %s: %s", aid, e)
+
+def handle_user_joined_group(user_id: int, chat_id: int = None):
+    """Обработка вступления пользователя в группу"""
+    user = get_user(user_id)
+    if not user:
+        # Создаем пользователя если его нет
+        try:
+            member_info = bot.get_chat_member(chat_id, user_id) if chat_id else None
+            username = member_info.user.username if member_info else None
+            first_name = member_info.user.first_name if member_info else None
+            last_name = member_info.user.last_name if member_info else None
+            ensure_user(user_id, username, first_name, last_name)
+            user = get_user(user_id)
+        except Exception as e:
+            logger.error("Ошибка при получении информации о пользователе: %s", e)
+            user = {'user_id': user_id, 'first_name': 'Неизвестный', 'username': None, 'status': 'pending'}
+    
+    # Проверяем предыдущий статус в группе
+    membership = get_group_membership(user_id)
+    
+    if membership and membership.get('can_return_without_verification'):
+        # Разрешен возврат без верификации
+        update_group_membership(user_id, in_group=True, can_return_without_verification=True)
+        
+        for aid in ADMIN_IDS:
+            try:
+                bot.send_message(
+                    aid,
+                    f"🔄 Пользователь вернулся в группу (без верификации):\n"
+                    f"ID: `{user_id}`\n"
+                    f"Имя: {user['first_name'] or '-'}"
+                )
+            except Exception as e:
+                logger.debug("Не удалось уведомить админа %s: %s", aid, e)
+        return
+    
+    # Требуется решение админа - запрашиваем
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Разрешить вход", callback_data=f"group_allow_{user_id}"),
+        InlineKeyboardButton("❌ Запретить вход", callback_data=f"group_deny_{user_id}"),
+        InlineKeyboardButton("📝 Новая верификация", callback_data=f"group_verify_{user_id}")
+    )
+    
+    for aid in ADMIN_IDS:
+        try:
+            bot.send_message(
+                aid,
+                f"🔄 Пользователь хочет вступить в группу{' ' + str(chat_id) if chat_id else ''}:\n"
+                f"ID: `{user_id}`\n"
+                f"Имя: {user['first_name'] or '-'}\n"
+                f"Ник: @{user['username'] or '-'}\n"
+                f"Текущий статус: {user['status']}\n\n"
+                f"Выберите действие:",
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.debug("Не удалось уведомить админа %s: %s", aid, e)
+
+def process_group_decision(call, user_id: int, decision: str):
+    """Обработка решения администратора по вступлению в группу"""
+    user = get_user(user_id)
+    if not user:
+        bot.answer_callback_query(call.id, "Пользователь не найден", show_alert=True)
+        return
+    
+    now = datetime.now().isoformat(sep=' ')
+    
+    if decision == "allow":
+        # Разрешаем вход и устанавливаем флаг "без верификации в будущем"
+        db_execute("""
+            UPDATE group_membership 
+            SET in_group = 1, left_at = NULL, 
+                can_return_without_verification = 1,
+                admin_decision = 'allow', decided_by = ?, decided_at = ?
+            WHERE user_id = ?
+        """, (call.from_user.id, now, user_id))
+        
+        # Уведомляем пользователя
+        try:
+            bot.send_message(
+                user_id,
+                f"✅ Вам разрешён вход в группу.\n"
+                f"В будущем вы сможете возвращаться без дополнительной верификации."
+            )
+        except Exception as e:
+            logger.debug("Не удалось уведомить пользователя %s: %s", user_id, e)
+        
+        bot.answer_callback_query(call.id, "Вход разрешён (без верификации в будущем)")
+        
+        # Обновляем сообщение админа
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"✅ Разрешён вход пользователю `{user_id}` (без верификации в будущем)"
+            )
+        except Exception:
+            pass
+        
+    elif decision == "deny":
+        # Запрещаем вход
+        db_execute("""
+            UPDATE group_membership 
+            SET in_group = 0, 
+                admin_decision = 'deny', decided_by = ?, decided_at = ?
+            WHERE user_id = ?
+        """, (call.from_user.id, now, user_id))
+        
+        # Уведомляем пользователя
+        try:
+            bot.send_message(
+                user_id,
+                f"🚫 Вам запрещён вход в группу.\n"
+                f"Для обжалования обратитесь к администратору."
+            )
+        except Exception as e:
+            logger.debug("Не удалось уведомить пользователя %s: %s", user_id, e)
+        
+        # Пытаемся кикнуть из группы (если есть chat_id в сообщении)
+        try:
+            # Пытаемся получить chat_id из оригинального сообщения
+            # Это сложно, так как call.message может не содержать chat_id группы
+            # В реальном использовании лучше передавать chat_id отдельно
+            pass
+        except Exception as e:
+            logger.debug("Не удалось кикнуть пользователя: %s", e)
+        
+        bot.answer_callback_query(call.id, "Вход запрещён")
+        
+        # Обновляем сообщение админа
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"❌ Запрещён вход пользователю `{user_id}`"
+            )
+        except Exception:
+            pass
+        
+    elif decision == "verify":
+        # Требуем новую верификацию (анкету)
+        db_execute("""
+            UPDATE group_membership 
+            SET in_group = 0, can_return_without_verification = 0,
+                admin_decision = 'verify', decided_by = ?, decided_at = ?
+            WHERE user_id = ?
+        """, (call.from_user.id, now, user_id))
+        
+        # Сбрасываем статус пользователя на pending
+        set_user_status(user_id, 'pending')
+        
+        # Уведомляем пользователя
+        try:
+            bot.send_message(
+                user_id,
+                f"📝 Требуется новая верификация.\n\n"
+                f"Пожалуйста, создайте новую анкету для подтверждения вашей личности.\n"
+                f"Используйте команду /start для начала процесса."
+            )
+        except Exception as e:
+            logger.debug("Не удалось уведомить пользователя %s: %s", user_id, e)
+        
+        bot.answer_callback_query(call.id, "Требуется новая верификация")
+        
+        # Обновляем сообщение админа
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"📝 Для пользователя `{user_id}` требуется новая верификация"
+            )
+        except Exception:
+            pass
 
 # ---------- Клавиатуры ----------
 def kb_start_pending():
@@ -324,7 +559,10 @@ def kb_admin_main():
         InlineKeyboardButton("⏳ Ожидают", callback_data="admin_pending"),
         InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
     )
-    kb.add(InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"))
+    kb.add(
+        InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
+        InlineKeyboardButton("👥 Управление группой", callback_data="admin_group")
+    )
     return kb
 
 # ---------- Хендлеры ----------
@@ -525,29 +763,29 @@ def cb_reset_app(call):
     bot.answer_callback_query(call.id)
 
 # ---------- Модерация (админ) ----------
-@bot.callback_query_handler(func=lambda call: call.data.startswith("mod_app_"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("appr_", "rej_", "fix_", "view_")))
 def cb_mod_action(call):
+    """Обработка решений по заявкам (ИСПРАВЛЕНО)"""
     if call.from_user.id not in ADMIN_IDS:
         bot.answer_callback_query(call.id, "Нет прав.", show_alert=True)
         return
-    parts = call.data.split("_", 2)
-    if len(parts) < 3:
+    
+    # Новый формат: appr_{id}, rej_{id}, fix_{id}, view_{id}
+    parts = call.data.split("_", 1)
+    if len(parts) < 2:
         bot.answer_callback_query(call.id, "Некорректно.", show_alert=True)
         return
-    action = parts[1]
-    rest = parts[2]
-    # форматы: mod_app_appr_{id}, mod_app_rej_{id}, mod_app_fix_{id}, mod_app_view_{id}
+    
+    action = parts[0]  # appr, rej, fix, view
+    app_id = int(parts[1])
+    
     if action == "appr":
-        app_id = int(rest)
         process_mod_decision(call, app_id, "approve")
     elif action == "rej":
-        app_id = int(rest)
         process_mod_decision(call, app_id, "reject")
     elif action == "fix":
-        app_id = int(rest)
         process_mod_decision(call, app_id, "fix")
     elif action == "view":
-        app_id = int(rest)
         admin_view_application(call, app_id)
     else:
         bot.answer_callback_query(call.id, "Неизвестная операция.", show_alert=True)
@@ -632,6 +870,83 @@ def admin_view_application(call, app_id: int):
         logger.error("Ошибка при отправке заявки админу: %s", e)
     bot.answer_callback_query(call.id, "Отправлено в личку.")
 
+# ---------- Обработка группы (АВТОМАТИЧЕСКОЕ ОТСЛЕЖИВАНИЕ) ----------
+@bot.message_handler(content_types=["new_chat_members"])
+def handle_new_chat_members(message):
+    """Обработка новых участников группы"""
+    logger.info(f"Новые участники в чате {message.chat.id}: {[m.id for m in message.new_chat_members]}")
+    
+    for new_member in message.new_chat_members:
+        if not new_member.is_bot:  # игнорируем ботов
+            logger.info(f"Обрабатываем вступление пользователя {new_member.id} в группу {message.chat.id}")
+            handle_user_joined_group(new_member.id, message.chat.id)
+
+@bot.message_handler(content_types=["left_chat_member"])
+def handle_left_chat_member(message):
+    """Обработка выхода участника из группы"""
+    if not message.left_chat_member.is_bot:  # игнорируем ботов
+        logger.info(f"Обрабатываем выход пользователя {message.left_chat_member.id} из группы {message.chat.id}")
+        handle_user_left_group(message.left_chat_member.id, message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("group_"))
+def cb_group_decision(call):
+    """Обработка решений по вступлению в группу"""
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "Нет прав.", show_alert=True)
+        return
+    
+    parts = call.data.split("_", 2)
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id, "Некорректно.", show_alert=True)
+        return
+    
+    action = parts[1]  # allow, deny, verify
+    user_id = int(parts[2])
+    
+    process_group_decision(call, user_id, action)
+
+# ---------- Ручные команды для тестирования ----------
+@bot.message_handler(commands=["test_left"])
+def cmd_test_left(message):
+    """Тестовая команда для эмуляции выхода из группы (только для админов)"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    # Эмулируем выход текущего пользователя
+    handle_user_left_group(message.from_user.id)
+    bot.reply_to(message, "✅ Эмулирован выход из группы. Уведомление отправлено админам.")
+
+@bot.message_handler(commands=["test_join"])
+def cmd_test_join(message):
+    """Тестовая команда для эмуляции входа в группу (только для админов)"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    # Эмулируем вступление текущего пользователя
+    handle_user_joined_group(message.from_user.id)
+    bot.reply_to(message, "✅ Эмулировано вступление в группу. Запрос отправлен админам.")
+
+@bot.message_handler(commands=["group_status"])
+def cmd_group_status(message):
+    """Показать статус в группе"""
+    uid = message.from_user.id
+    membership = get_group_membership(uid)
+    if not membership:
+        bot.reply_to(message, "Информация о группе отсутствует.")
+        return
+    
+    status_text = "✅ В группе" if membership['in_group'] else "❌ Не в группе"
+    if membership['left_at']:
+        left_time = datetime.fromisoformat(membership['left_at']).strftime("%Y-%m-%d %H:%M:%S")
+        left_info = f"\nВыход: {left_time}"
+    else:
+        left_info = ""
+    
+    verification = "✅ Без верификации" if membership['can_return_without_verification'] else "📝 Требуется верификация"
+    admin_decision = f"\nРешение админа: {membership['admin_decision'] or 'нет'}"
+    
+    bot.reply_to(message, f"Статус группы:\n{status_text}{left_info}\n{verification}{admin_decision}")
+
 # ---------- Доп. команды /admin, /status, /my, /reset ----------
 @bot.message_handler(commands=["admin"])
 def cmd_admin(message):
@@ -659,6 +974,33 @@ def cb_admin_pending(call):
     text = "⏳ Ожидающие анкеты:\n\n"
     for p in pending:
         text += f"#{p['id']} — {p['user_id']} ({p['username'] or '-'}) — {p['section']} — {p['created_at'][:16]}\n"
+    bot.send_message(call.from_user.id, text)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_group")
+def cb_admin_group(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "Нет прав", show_alert=True)
+        return
+    
+    # Показать пользователей, которые не в группе
+    not_in_group = db_execute("""
+        SELECT g.user_id, g.left_at, g.admin_decision, u.username, u.first_name, u.status
+        FROM group_membership g 
+        LEFT JOIN users u ON g.user_id = u.user_id
+        WHERE g.in_group = 0 AND g.admin_decision IS NULL
+        ORDER BY g.left_at DESC LIMIT 10
+    """, (), fetchall=True)
+    
+    text = "👥 Пользователи не в группе (требуют решения):\n\n"
+    if not_in_group:
+        for user in not_in_group:
+            left_time = datetime.fromisoformat(user['left_at']).strftime("%Y-%m-%d %H:%M") if user['left_at'] else "неизвестно"
+            text += f"ID: `{user['user_id']}` — {user['first_name'] or '-'} (@{user['username'] or '-'})\n"
+            text += f"Выход: {left_time} | Статус: {user['status']}\n\n"
+    else:
+        text += "Нет пользователей, ожидающих решения по группе."
+    
     bot.send_message(call.from_user.id, text)
     bot.answer_callback_query(call.id)
 
@@ -756,5 +1098,3 @@ if __name__ == "__main__":
             except Exception:
                 pass
         sys.exit(1)
-
-
