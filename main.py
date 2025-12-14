@@ -1,594 +1,760 @@
-import telebot
-import sqlite3
-import logging
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+Telegram moderation bot
+- Статусы пользователя: pending, approved, banned
+- Пользователь создаёт одну анкету (application) в статусе pending
+- В анкете собираются медиа: media_type = normal | intimate (по одному и более)
+- Анкета видна только админам; админ принимает единое решение:
+    approve -> user.status = approved (полный доступ)
+    reject  -> user.status = banned (полный бан)
+    fix     -> возвращает возможность доработать анкету
+- Разделы (menu) скрыты от пользователей в статусе pending/banned, видны только approved
+- Пользователь может выбрать ОДИН раздел при создании анкеты; смена запрещена пока не сбросит админ/пользователь (по команде)
+"""
 import os
 import sys
-import atexit
+import logging
+import threading
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, Dict, Any
+from flask import Flask, request
 import signal
+import time
+import json
+
+import telebot
+from telebot import apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from typing import Optional, Tuple
 
-# ================= БЛОКИРОВКА ДУБЛИРУЮЩЕГО ЗАПУСКА =================
-def check_single_instance():
-    """
-    Проверка, что бот запущен только в одном экземпляре.
-    Создает lock-файл и удаляет его при корректном завершении.
-    """
-    # Используем уникальное имя файла на основе токена бота
-    lock_file = "/tmp/telegram_bot.lock"
-    
-    # Проверяем, существует ли lock-файл
-    if os.path.exists(lock_file):
-        print("❌ ОШИБКА: Бот уже запущен в другом процессе!")
-        print("   Убедитесь, что:")
-        print("   1. Нет других запущенных экземпляров этого бота")
-        print("   2. Предыдущий процесс был корректно завершен")
-        print("   3. На других хостингах/компьютерах не запущен тот же бот")
-        
-        # Пытаемся прочитать PID из lock-файла
-        try:
-            with open(lock_file, "r") as f:
-                old_pid = f.read().strip()
-                print(f"   Обнаружен процесс с PID: {old_pid}")
-        except:
-            pass
-            
-        sys.exit(1)  # Завершаем процесс с ошибкой
-    
-    # Создаем новый lock-файл
-    try:
-        with open(lock_file, "w") as f:
-            f.write(str(os.getpid()))  # Записываем текущий PID
-        print(f"✅ Lock-файл создан: {lock_file}")
-    except Exception as e:
-        print(f"⚠️  Не удалось создать lock-файл: {e}")
-        # Продолжаем выполнение, но предупреждаем
-
-# Функция для удаления lock-файла при завершении
-def cleanup_lock_file():
-    """Удаляет lock-файл при корректном завершении программы"""
-    lock_file = "/tmp/telegram_bot.lock"
-    if os.path.exists(lock_file):
-        try:
-            os.remove(lock_file)
-            print(f"✅ Lock-файл удален: {lock_file}")
-        except Exception as e:
-            print(f"⚠️  Не удалось удалить lock-файл: {e}")
-
-# Регистрируем функцию очистки
-atexit.register(cleanup_lock_file)
-
-# Обработчик сигналов для корректного завершения
-def signal_handler(signum, frame):
-    """Обработчик сигналов для корректного завершения"""
-    print(f"\n⚠️  Получен сигнал {signum}, завершаем работу...")
-    cleanup_lock_file()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler)  # Сигнал завершения
-
-# Проверяем одиночный запуск ДО всех остальных действий
-check_single_instance()
-
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = "8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI"
-ADMIN_ID = 5064426902
-
-# Настройка логирования для отслеживания ошибок
+# ---------- ЛОГИРОВАНИЕ ----------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
+# ---------- НАСТРОЙКИ ----------
+
+# Токен бота (строго в кавычках)
+BOT_TOKEN = "8485486677:AAHqx7YjGMn5pn2pDTADwllNDjJmYAK-KFI"
+
+# ID администраторов (список чисел)
+ADMIN_IDS = [5064426902]  # можешь добавить через запятую несколько ID
+
+# Лимит частоты (минуты). Если не используешь — оставляй как есть.
+RATE_LIMIT_MINUTES = 5
+
+# Ключ для внутреннего API админов (можешь оставить любое значение)
+ADMIN_API_KEY = "secret"
+
+# Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# ================= ПРОВЕРКА СОЕДИНЕНИЯ С TELEGRAM API =================
-def check_telegram_connection():
-    """Проверка подключения к Telegram API и отсутствия конфликтов"""
-    try:
-        print("🔍 Проверка подключения к Telegram API...")
-        
-        # Пытаемся получить информацию о боте
-        bot_info = bot.get_me()
-        print(f"✅ Бот подключен: @{bot_info.username} (ID: {bot_info.id})")
-        
-        # Проверяем, нет ли активных сессий getUpdates
-        try:
-            # Пробуем получить updates с offset=-1 для проверки
-            bot.get_updates(offset=-1, timeout=1)
-            print("✅ API доступно, конфликтов не обнаружено")
-        except Exception as api_error:
-            if "409" in str(api_error):
-                print("❌ ОБНАРУЖЕН КОНФЛИКТ: Другой экземпляр бота уже запущен!")
-                print("   Решение:")
-                print("   1. Приостановите службу на Render (если развернуто там)")
-                print("   2. Остановите локально запущенный бот")
-                print("   3. Подождите 30 секунд и попробуйте снова")
-                return False
-            else:
-                print(f"⚠️  Предупреждение при проверке API: {api_error}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Ошибка подключения к Telegram API: {e}")
-        print("   Проверьте:")
-        print("   1. Корректность токена бота")
-        print("   2. Доступность Telegram API из вашей сети")
-        print("   3. Не истек ли срок действия токена")
-        return False
+# ---------- БАЗА ДАННЫХ (потокобезопасно) ----------
+DB_PATH = os.getenv("DB_PATH", "moderation_bot.db")
+_db_lock = threading.Lock()
 
-# ================= БАЗА ДАННЫХ =================
+def _conn():
+    # отдельное соединение на вызов
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    """Инициализация базы данных с правильной структурой"""
-    conn = sqlite3.connect("users.db", check_same_thread=False)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS applications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        section TEXT,
-        normal_count INTEGER DEFAULT 0,
-        intimate_count INTEGER DEFAULT 0,
-        photo_type TEXT DEFAULT NULL,  -- 'normal' или 'intimate'
-        app_status TEXT DEFAULT 'pending',  -- статус заявки
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )
-    """)
-    
-    # Создание индексов для ускорения запросов
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user_id ON applications (user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications (app_status)")
-    
-    conn.commit()
-    return conn, cursor
+    with _db_lock:
+        conn = _conn()
+        cur = conn.cursor()
+        # users: статус pending/approved/banned
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            status TEXT DEFAULT 'pending', -- pending|approved|banned
+            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        # applications: одна заявка/пользователь (можно создавать новые, но только одна активная pending)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            section TEXT NOT NULL,
+            status INTEGER DEFAULT 0, -- 0 pending, 1 approved, -1 rejected, 2 needs_fix
+            moderator_id INTEGER,
+            moderated_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """)
+        # media: прикреплённые файлы к application
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_id INTEGER NOT NULL,
+            media_type TEXT NOT NULL, -- normal | intimate
+            kind TEXT NOT NULL,       -- photo | video | animation
+            file_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
+        )
+        """)
+        # user_state: временное состояние для загрузки медиа и выбора действий
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_state (
+            user_id INTEGER PRIMARY KEY,
+            current_app_id INTEGER,
+            awaiting_media_type TEXT, -- normal | intimate | None
+            last_action TEXT, -- for debug
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        # indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_app_user ON applications(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_media_app ON media(application_id)")
+        conn.commit()
+        conn.close()
 
-conn, cursor = init_db()
+init_db()
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-def get_user_status(user_id: int) -> Optional[str]:
-    """Получить статус пользователя"""
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else None
+# ---------- Утилиты работы с БД ----------
+def db_execute(query: str, params: Tuple = (), fetchone: bool = False, fetchall: bool = False, return_id: bool = False):
+    with _db_lock:
+        conn = _conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(query, params)
+            conn.commit()
+            if return_id:
+                return cur.lastrowid
+            if fetchone:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetchall:
+                rows = cur.fetchall()
+                return [dict(r) for r in rows] if rows else []
+            return cur.rowcount
+        except Exception as e:
+            logger.error("DB error: %s | Q: %s | P: %s", e, query, params)
+            return None
+        finally:
+            conn.close()
 
-def set_user_status(user_id: int, status: str) -> None:
-    """Установить статус пользователя"""
-    cursor.execute(
-        "INSERT OR REPLACE INTO users (user_id, status) VALUES (?, ?)",
-        (user_id, status)
-    )
-    conn.commit()
-
-def get_application(user_id: int) -> Optional[Tuple]:
-    """Получить активную заявку пользователя"""
-    cursor.execute("""
-        SELECT section, normal_count, intimate_count, photo_type, app_status 
-        FROM applications 
-        WHERE user_id = ? AND app_status = 'pending'
-        ORDER BY created_at DESC LIMIT 1
-    """, (user_id,))
-    return cursor.fetchone()
-
-def create_application(user_id: int, section: str) -> None:
-    """Создать новую заявку"""
-    cursor.execute("""
-        INSERT INTO applications (user_id, section, app_status) 
-        VALUES (?, ?, 'pending')
-    """, (user_id, section))
-    conn.commit()
-
-def update_photo_count(user_id: int, photo_type: str) -> bool:
-    """Обновить счетчик фотографий в зависимости от типа"""
-    if photo_type == "normal":
-        cursor.execute("""
-            UPDATE applications 
-            SET normal_count = normal_count + 1 
-            WHERE user_id = ? AND app_status = 'pending'
-        """, (user_id,))
-    elif photo_type == "intimate":
-        cursor.execute("""
-            UPDATE applications 
-            SET intimate_count = intimate_count + 1 
-            WHERE user_id = ? AND app_status = 'pending'
-        """, (user_id,))
+# ---------- Основные функции модели ----------
+def ensure_user(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str] = ""):
+    """Создать пользователя или обновить поля"""
+    existing = db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    if existing:
+        db_execute("""
+            UPDATE users SET username = ?, first_name = ?, last_name = ?, last_activity = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (username, first_name, last_name, user_id))
     else:
-        return False
-    
-    conn.commit()
-    return cursor.rowcount > 0
+        db_execute("""
+            INSERT INTO users (user_id, username, first_name, last_name, status)
+            VALUES (?, ?, ?, ?, 'pending')
+        """, (user_id, username, first_name, last_name))
+        # уведомляем админов о новом пользователе
+        notify_admins_new_user(user_id, username, first_name, last_name)
 
-def set_photo_type(user_id: int, photo_type: str) -> bool:
-    """Установить тип фотографий для текущей заявки"""
-    cursor.execute("""
-        UPDATE applications 
-        SET photo_type = ? 
-        WHERE user_id = ? AND app_status = 'pending'
-    """, (photo_type, user_id))
-    conn.commit()
-    return cursor.rowcount > 0
+def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    return db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
 
-def get_photo_type(user_id: int) -> Optional[str]:
-    """Получить текущий тип фотографий для заявки"""
-    cursor.execute("""
-        SELECT photo_type FROM applications 
-        WHERE user_id = ? AND app_status = 'pending'
-    """, (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else None
+def set_user_status(user_id: int, status: str):
+    db_execute("UPDATE users SET status = ?, last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (status, user_id))
 
-# ================= ОБРАБОТЧИКИ КОМАНД =================
-@bot.message_handler(commands=["start"])
-def handle_start(message):
-    """Обработчик команды /start"""
-    user_id = message.from_user.id
-    
-    # Регистрируем пользователя, если его нет
-    if get_user_status(user_id) is None:
-        set_user_status(user_id, "pending")
-        logger.info(f"Зарегистрирован новый пользователь: {user_id}")
-    
-    status = get_user_status(user_id)
-    
-    if status == "banned":
-        bot.send_message(user_id, "🚫 Вы заблокированы и не можете пользоваться ботом.")
+def get_active_application_for_user(user_id: int) -> Optional[Dict[str, Any]]:
+    return db_execute("""
+        SELECT * FROM applications WHERE user_id = ? AND status = 0 ORDER BY created_at DESC LIMIT 1
+    """, (user_id,), fetchone=True)
+
+def create_application(user_id: int, section: str) -> int:
+    # запрещаем создавать новую pending, если уже есть одна
+    active = get_active_application_for_user(user_id)
+    if active:
+        return active['id']
+    app_id = db_execute("""
+        INSERT INTO applications (user_id, section, status) VALUES (?, ?, 0)
+    """, (user_id, section), return_id=True)
+    # create/update user_state
+    db_execute("""
+        INSERT OR REPLACE INTO user_state (user_id, current_app_id, awaiting_media_type, last_action, updated_at)
+        VALUES (?, ?, NULL, 'created_app', CURRENT_TIMESTAMP)
+    """, (user_id, app_id))
+    return app_id
+
+def add_media(application_id: int, media_type: str, kind: str, file_id: str):
+    return db_execute("""
+        INSERT INTO media (application_id, media_type, kind, file_id) VALUES (?, ?, ?, ?)
+    """, (application_id, media_type, kind, file_id), return_id=True)
+
+def get_media_counts(application_id: int) -> Dict[str, int]:
+    rows = db_execute("""
+        SELECT media_type, COUNT(*) as cnt FROM media WHERE application_id = ? GROUP BY media_type
+    """, (application_id,), fetchall=True)
+    counts = {'normal': 0, 'intimate': 0}
+    for r in rows:
+        counts[r['media_type']] = r['cnt']
+    return counts
+
+def get_application(application_id: int) -> Optional[Dict[str, Any]]:
+    return db_execute("SELECT * FROM applications WHERE id = ?", (application_id,), fetchone=True)
+
+def set_application_status(application_id: int, new_status: int, moderator_id: Optional[int] = None):
+    now = datetime.now().isoformat(sep=' ')
+    db_execute("""
+        UPDATE applications SET status = ?, moderator_id = ?, moderated_at = ? WHERE id = ?
+    """, (new_status, moderator_id, now, application_id))
+    # если approved -> переводим пользователя в approved
+    app = get_application(application_id)
+    if not app:
         return
-    
-    if status == "approved":
-        bot.send_message(user_id, "✅ Ваш доступ уже активирован.")
-        return
-    
-    # Пользователь в ожидании
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("📝 Создать анкету", callback_data="create_app"))
-    
-    bot.send_message(
-        user_id,
-        "👋 Добро пожаловать!\n"
-        "Ваш статус: *Ожидание одобрения*\n\n"
-        "Для подачи заявки нажмите кнопку ниже:",
-        reply_markup=keyboard
+    uid = app['user_id']
+    if new_status == 1:
+        set_user_status(uid, 'approved')
+    elif new_status == -1:
+        set_user_status(uid, 'banned')
+    elif new_status == 2:
+        # needs_fix -> оставляем пользователя pending
+        set_user_status(uid, 'pending')
+
+def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
+    return db_execute("SELECT * FROM user_state WHERE user_id = ?", (user_id,), fetchone=True)
+
+def set_user_state(user_id: int, current_app_id: Optional[int], awaiting_media_type: Optional[str], last_action: str):
+    db_execute("""
+        INSERT OR REPLACE INTO user_state (user_id, current_app_id, awaiting_media_type, last_action, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (user_id, current_app_id, awaiting_media_type, last_action))
+
+def clear_user_state(user_id: int):
+    db_execute("DELETE FROM user_state WHERE user_id = ?", (user_id,))
+
+def check_rate_limit(user_id: int) -> Tuple[bool, int]:
+    """Последняя заявка (любая) — не раньше, чем RATE_LIMIT_MINUTES"""
+    last = db_execute("""
+        SELECT created_at FROM applications WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
+    """, (user_id,), fetchone=True)
+    if not last:
+        return True, 0
+    last_time = datetime.fromisoformat(last['created_at'])
+    diff = datetime.now() - last_time
+    minutes_passed = diff.total_seconds() / 60.0
+    if minutes_passed < RATE_LIMIT_MINUTES:
+        return False, int(RATE_LIMIT_MINUTES - minutes_passed) + 1
+    return True, 0
+
+def notify_admins_new_user(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
+    text = (
+        f"🆕 Новый пользователь: `{user_id}`\n"
+        f"Имя: {first_name or '-'} {last_name or '-'}\n"
+        f"Ник: @{username or '-'}\n"
+        f"Статус: pending\n"
+        f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
+    for aid in ADMIN_IDS:
+        try:
+            bot.send_message(aid, text)
+        except Exception as e:
+            logger.debug("Не удалось уведомить админа %s: %s", aid, e)
+
+def notify_admins_new_application(app_id: int):
+    app = get_application(app_id)
+    if not app:
+        return
+    uid = app['user_id']
+    user = get_user(uid)
+    text = (
+        f"📨 Новая анкета #{app_id}\n"
+        f"Пользователь: `{uid}` ({user['first_name'] or '-'}) @{user['username'] or '-'}\n"
+        f"Раздел: {app['section']}\n"
+        f"Время: {app['created_at']}\n"
+    )
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Одобрить", callback_data=f"mod_app_appr_{app_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"mod_app_rej_{app_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("✏️ Запросить правки", callback_data=f"mod_app_fix_{app_id}"),
+        InlineKeyboardButton("👁️ Просмотреть", callback_data=f"mod_app_view_{app_id}")
+    )
+    for aid in ADMIN_IDS:
+        try:
+            bot.send_message(aid, text, reply_markup=kb)
+        except Exception as e:
+            logger.debug("Не удалось отправить заявку админу %s: %s", aid, e)
+
+# ---------- Клавиатуры ----------
+def kb_start_pending():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📝 Создать анкету", callback_data="create_app"))
+    kb.add(InlineKeyboardButton("ℹ️ Статус", callback_data="show_status"))
+    return kb
+
+def section_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("Пары", callback_data="sec_пары"),
+        InlineKeyboardButton("Будуар", callback_data="sec_будуар"),
+        InlineKeyboardButton("Гараж", callback_data="sec_гараж")
+    )
+    return kb
+
+def kb_media_actions(application_id: int):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Добавить обычное", callback_data=f"add_normal_{application_id}"),
+        InlineKeyboardButton("➕ Добавить интимное", callback_data=f"add_intimate_{application_id}")
+    )
+    kb.add(
+        InlineKeyboardButton("✅ Готово (отправить на модерацию)", callback_data=f"submit_app_{application_id}"),
+        InlineKeyboardButton("🔄 Сбросить анкету", callback_data=f"reset_app_{application_id}")
+    )
+    return kb
+
+def kb_admin_main():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⏳ Ожидают", callback_data="admin_pending"),
+        InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+    )
+    kb.add(InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"))
+    return kb
+
+# ---------- Хендлеры ----------
+
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(message):
+    uid = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    ensure_user(uid, username, first_name, last_name)
+    user = get_user(uid)
+    # Забанен
+    if user and user['status'] == 'banned':
+        bot.send_message(uid, "🚫 Вы заблокированы и не можете использовать бота. Для вопросов обратитесь к администратору.")
+        return
+    # Approved -> показать разделы и инструкции
+    if user and user['status'] == 'approved':
+        text = (
+            "✅ Доступ открыт. Вы можете работать во всех разделах.\n\n"
+            "Выберите действие:\n"
+            "- Отправить контент прямо в чат\n"
+            "- /status — проверить статус\n"
+            "- /my — мои анкеты"
+        )
+        bot.send_message(uid, text)  # можно добавить keyboard если нужно
+        return
+    # pending
+    text = (
+        "📝 Вы в режиме ожидания (pending).\n\n"
+        "1) Нажмите «Создать анкету» — выберите раздел и загрузите фото.\n"
+        "2) Анкета будет скрыта от остальных и отправлена админам.\n"
+        "3) Админ принимает единое решение: одобрить / отклонить / запросить правки.\n\n"
+        "⚠️ Пока анкета не одобрена — разделы скрыты, писать в общие разделы нельзя."
+    )
+    bot.send_message(uid, text, reply_markup=kb_start_pending())
+
+@bot.callback_query_handler(func=lambda call: call.data == "show_status")
+def cb_show_status(call):
+    uid = call.from_user.id
+    user = get_user(uid)
+    if not user:
+        bot.answer_callback_query(call.id, "Не найден пользователь", show_alert=True)
+        return
+    app = get_active_application_for_user(uid)
+    app_text = f"Активная анкета: #{app['id']} / раздел: {app['section']}" if app else "Активная анкета: нет"
+    bot.send_message(uid,
+                     f"👤 ID: `{uid}`\nСтатус: {user['status']}\n{app_text}"
+                     )
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "create_app")
-def handle_create_application(call):
-    """Создание новой анкеты"""
-    user_id = call.from_user.id
-    
-    # Проверяем, нет ли уже активной заявки
-    if get_application(user_id):
-        bot.send_message(user_id, "⚠️ У вас уже есть активная заявка.")
+def cb_create_app(call):
+    uid = call.from_user.id
+    user = get_user(uid)
+    if not user:
+        bot.answer_callback_query(call.id, "Нужен /start сначала", show_alert=True)
         return
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    sections = ["Пары", "Будуар", "Гараж"]
-    for section in sections:
-        keyboard.add(InlineKeyboardButton(section, callback_data=f"section_{section}"))
-    
-    bot.edit_message_text(
-        "📋 *Создание анкеты*\n\n"
-        "Выберите раздел для вашей анкеты:",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=keyboard
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("section_"))
-def handle_section_selection(call):
-    """Обработка выбора раздела"""
-    user_id = call.from_user.id
-    section = call.data.replace("section_", "")
-    
-    # Создаем новую заявку
-    create_application(user_id, section)
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.row(
-        InlineKeyboardButton("➕ Обычные фото", callback_data="type_normal"),
-        InlineKeyboardButton("➕ Интимные фото", callback_data="type_intimate")
-    )
-    keyboard.add(InlineKeyboardButton("✅ Отправить на проверку", callback_data="submit_app"))
-    
-    bot.edit_message_text(
-        f"📂 *Раздел:* {section}\n\n"
-        "Теперь добавьте фотографии:\n"
-        "1. Выберите тип фото (обычные/интимные)\n"
-        "2. Отправьте фото соответствующего типа\n"
-        "3. Повторите для другого типа\n\n"
-        "*Требование:* минимум 1 обычное и 1 интимное фото",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=keyboard
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("type_"))
-def handle_photo_type_selection(call):
-    """Установка типа фотографий"""
-    user_id = call.from_user.id
-    photo_type = call.data.replace("type_", "")  # "normal" или "intimate"
-    
-    if not set_photo_type(user_id, photo_type):
-        bot.answer_callback_query(call.id, "❌ Сначала создайте анкету!")
+    if user['status'] == 'approved':
+        bot.answer_callback_query(call.id, "У вас уже открыт доступ (approved).", show_alert=True)
         return
-    
-    type_name = "обычные" if photo_type == "normal" else "интимные"
-    bot.answer_callback_query(call.id, f"✅ Теперь отправляйте {type_name} фото")
-    
-    bot.send_message(
-        user_id,
-        f"📸 Теперь отправляйте *{type_name} фото*.\n"
-        "Каждое отправленное фото будет автоматически добавлено к вашей анкете."
-    )
-
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message):
-    """Обработка фотографий"""
-    user_id = message.from_user.id
-    
-    # Получаем текущий тип фото для заявки
-    photo_type = get_photo_type(user_id)
-    
-    if not photo_type:
-        bot.send_message(user_id, "⚠️ Сначала выберите тип фото (обычные/интимные)")
+    if user['status'] == 'banned':
+        bot.answer_callback_query(call.id, "Вы заблокированы.", show_alert=True)
         return
-    
-    # Обновляем счетчик
-    if update_photo_count(user_id, photo_type):
-        type_name = "обычных" if photo_type == "normal" else "интимных"
-        
-        # Получаем текущие счетчики
-        app = get_application(user_id)
-        if app:
-            normal_count, intimate_count = app[1], app[2]
-            
-            bot.send_message(
-                user_id,
-                f"✅ Фото сохранено как {type_name}.\n\n"
-                f"📊 *Текущий прогресс:*\n"
-                f"• Обычные фото: {normal_count}\n"
-                f"• Интимные фото: {intimate_count}"
-            )
+    # показать клавиатуру разделов
+    bot.send_message(uid, "Выберите раздел для анкеты (можно выбрать только один):", reply_markup=section_kb())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sec_"))
+def cb_section_select(call):
+    uid = call.from_user.id
+    user = get_user(uid)
+    if not user:
+        bot.answer_callback_query(call.id, "Нужен /start сначала", show_alert=True)
+        return
+    if user['status'] != 'pending':
+        bot.answer_callback_query(call.id, "Нельзя создавать анкету в текущем статусе.", show_alert=True)
+        return
+    section = call.data.split("_", 1)[1]
+    # rate limit (между созданием анкет)
+    can_create, wait = check_rate_limit(uid)
+    if not can_create:
+        bot.answer_callback_query(call.id, f"Нельзя создавать новую анкету. Подождите {wait} мин.", show_alert=True)
+        return
+    app_id = create_application(uid, section)
+    # send instructions and media keyboard
+    text = (
+        f"📝 Анкета #{app_id} создана. Раздел: *{section}*.\n\n"
+        "Теперь нужно загрузить медиа:\n"
+        "• Обычные фото — 1 или более\n"
+        "• Интимные фото — 1 или более\n\n"
+        "Порядок любой. Нажимайте кнопки ниже, чтобы добавить соответствующий тип и отправить файлы.\n"
+        "Когда всё готово — нажмите *Готово (отправить на модерацию)*."
+    )
+    bot.send_message(uid, text, reply_markup=kb_media_actions(app_id))
+    notify_admins_new_application(app_id)
+    bot.answer_callback_query(call.id, "Анкета создана. Проверьте инструкции в личных сообщениях.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("add_normal_", "add_intimate_")))
+def cb_add_media_start(call):
+    uid = call.from_user.id
+    parts = call.data.split("_")
+    kind = parts[0]  # add
+    media_tag = parts[1] if len(parts) > 1 else None
+    # call.data formats: add_normal_{appid} or add_intimate_{appid}
+    if call.data.startswith("add_normal_"):
+        app_id = int(call.data.split("_", 2)[2])
+        media_type = "normal"
     else:
-        bot.send_message(user_id, "❌ Не удалось сохранить фото. У вас есть активная заявка?")
+        app_id = int(call.data.split("_", 2)[2])
+        media_type = "intimate"
+    # verify app exists and belongs to user and is pending
+    app = get_application(app_id)
+    if not app or app['user_id'] != uid or app['status'] != 0:
+        bot.answer_callback_query(call.id, "Анкета не найдена или недоступна.", show_alert=True)
+        return
+    # set user_state awaiting media
+    set_user_state(uid, app_id, media_type, f"awaiting_{media_type}")
+    bot.send_message(uid, f"Отправьте файл(ы) для типа *{media_type}*. Поддерживаются: фото, видео, GIF. Можно отправлять несколько сообщений по одному файлу.")
+    bot.answer_callback_query(call.id, f"Отправьте файлы для {media_type}")
 
-@bot.callback_query_handler(func=lambda call: call.data == "submit_app")
-def handle_submission(call):
-    """Отправка заявки на проверку"""
-    user_id = call.from_user.id
-    
-    # Проверяем заявку
-    app = get_application(user_id)
+@bot.message_handler(content_types=["photo", "video", "animation"])
+def media_receive(message):
+    uid = message.from_user.id
+    user = get_user(uid)
+    if not user:
+        bot.reply_to(message, "Нужен /start сначала.")
+        return
+    if user['status'] == 'banned':
+        bot.reply_to(message, "🚫 Вы заблокированы.")
+        return
+    state = get_user_state(uid)
+    if not state or not state.get('current_app_id') or not state.get('awaiting_media_type'):
+        bot.reply_to(message, "ℹ️ Сначала нажмите кнопку 'Добавить обычное' или 'Добавить интимное' в меню анкеты.")
+        return
+    app_id = state['current_app_id']
+    app = get_application(app_id)
+    if not app or app['user_id'] != uid or app['status'] != 0:
+        bot.reply_to(message, "Анкета не найдена или уже отправлена.")
+        return
+    media_type = state['awaiting_media_type']  # normal | intimate
+    # determine file_id and kind
+    if message.content_type == 'photo':
+        file_id = message.photo[-1].file_id
+        kind = 'photo'
+    elif message.content_type == 'video':
+        file_id = message.video.file_id
+        kind = 'video'
+    elif message.content_type == 'animation':
+        file_id = message.animation.file_id
+        kind = 'animation'
+    else:
+        bot.reply_to(message, "Неподдерживаемый тип.")
+        return
+    mid = add_media(app_id, media_type, kind, file_id)
+    if not mid:
+        bot.reply_to(message, "Ошибка при сохранении файла.")
+        return
+    bot.reply_to(message, f"Файл сохранён (тип: {media_type}). Чтобы добавить другой тип — нажмите соответствующую кнопку. Готово — нажмите «Готово (отправить на модерацию)» в меню анкеты.")
+    # обновим user_state.updated_at
+    set_user_state(uid, app_id, media_type, f"added_media_{media_type}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("submit_app_"))
+def cb_submit_app(call):
+    uid = call.from_user.id
+    app_id = int(call.data.split("_", 2)[2])
+    app = get_application(app_id)
+    if not app or app['user_id'] != uid:
+        bot.answer_callback_query(call.id, "Анкета не найдена.", show_alert=True)
+        return
+    if app['status'] != 0:
+        bot.answer_callback_query(call.id, "Анкета уже обработана.", show_alert=True)
+        return
+    counts = get_media_counts(app_id)
+    if counts.get('normal', 0) < 1 or counts.get('intimate', 0) < 1:
+        bot.answer_callback_query(call.id, "Нужно минимум 1 обычное и 1 интимное фото.", show_alert=True)
+        return
+    # Помечаем как pending (она уже pending), уведомляем админов (если не отправляли)
+    notify_admins_new_application(app_id)
+    # очистим состояние
+    clear_user_state(uid)
+    bot.send_message(uid, f"✅ Анкета #{app_id} отправлена на модерацию. Ожидайте решения администратора.")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reset_app_"))
+def cb_reset_app(call):
+    uid = call.from_user.id
+    app_id = int(call.data.split("_", 2)[2])
+    app = get_application(app_id)
+    if not app or app['user_id'] != uid:
+        bot.answer_callback_query(call.id, "Анкета не найдена.", show_alert=True)
+        return
+    # удаляем медиа и саму анкету (пользователь может создать новую)
+    db_execute("DELETE FROM media WHERE application_id = ?", (app_id,))
+    db_execute("DELETE FROM applications WHERE id = ?", (app_id,))
+    clear_user_state(uid)
+    bot.send_message(uid, "🔄 Ваша анкета сброшена. Можете создать новую анкету.")
+    bot.answer_callback_query(call.id)
+
+# ---------- Модерация (админ) ----------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mod_app_"))
+def cb_mod_action(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "Нет прав.", show_alert=True)
+        return
+    parts = call.data.split("_", 2)
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id, "Некорректно.", show_alert=True)
+        return
+    action = parts[1]
+    rest = parts[2]
+    # форматы: mod_app_appr_{id}, mod_app_rej_{id}, mod_app_fix_{id}, mod_app_view_{id}
+    if action == "appr":
+        app_id = int(rest)
+        process_mod_decision(call, app_id, "approve")
+    elif action == "rej":
+        app_id = int(rest)
+        process_mod_decision(call, app_id, "reject")
+    elif action == "fix":
+        app_id = int(rest)
+        process_mod_decision(call, app_id, "fix")
+    elif action == "view":
+        app_id = int(rest)
+        admin_view_application(call, app_id)
+    else:
+        bot.answer_callback_query(call.id, "Неизвестная операция.", show_alert=True)
+
+def process_mod_decision(call, app_id: int, decision: str):
+    app = get_application(app_id)
     if not app:
-        bot.answer_callback_query(call.id, "❌ У вас нет активной заявки!")
+        bot.answer_callback_query(call.id, "Анкета не найдена.", show_alert=True)
         return
-    
-    section, normal_count, intimate_count, photo_type, status = app
-    
-    # Проверяем минимальные требования
-    if normal_count < 1 or intimate_count < 1:
-        bot.answer_callback_query(
-            call.id,
-            f"❌ Нужно минимум 1 обычное и 1 интимное фото (сейчас: {normal_count}/{intimate_count})"
-        )
-        return
-    
-    # Отправляем админу
-    keyboard = InlineKeyboardMarkup()
-    keyboard.row(
-        InlineKeyboardButton("✅ Одобрить", callback_data=f"admin_approve_{user_id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_reject_{user_id}")
-    )
-    
-    try:
-        bot.send_message(
-            ADMIN_ID,
-            f"📨 *Новая заявка*\n\n"
-            f"👤 *Пользователь:* {user_id}\n"
-            f"📂 *Раздел:* {section}\n"
-            f"📷 *Обычных фото:* {normal_count}\n"
-            f"🔞 *Интимных фото:* {intimate_count}\n\n"
-            f"🕒 Время: {call.message.date}",
-            reply_markup=keyboard
-        )
-        
-        # Обновляем статус заявки
-        cursor.execute("""
-            UPDATE applications 
-            SET app_status = 'submitted' 
-            WHERE user_id = ? AND app_status = 'pending'
-        """, (user_id,))
-        conn.commit()
-        
-        bot.edit_message_text(
-            "✅ *Заявка отправлена на проверку!*\n\n"
-            "Администратор получил вашу анкету и скоро примет решение.\n"
-            "Ожидайте уведомления.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-        
-        logger.info(f"Заявка отправлена: пользователь {user_id}, раздел {section}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка отправки. Попробуйте позже.")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
-def handle_admin_decision(call):
-    """Обработка решения администратора"""
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Только администратор может это делать!")
-        return
-    
-    action, user_id_str = call.data.split("_")[1], call.data.split("_")[2]
-    user_id = int(user_id_str)
-    
-    # Получаем информацию о заявке
-    cursor.execute("""
-        SELECT section FROM applications 
-        WHERE user_id = ? AND app_status = 'submitted'
-        ORDER BY created_at DESC LIMIT 1
-    """, (user_id,))
-    result = cursor.fetchone()
-    
-    if not result:
-        bot.answer_callback_query(call.id, "❌ Заявка не найдена!")
-        return
-    
-    section = result[0]
-    
-    if action == "approve":
-        # Одобряем пользователя
-        set_user_status(user_id, "approved")
-        
-        # Обновляем статус заявки
-        cursor.execute("""
-            UPDATE applications 
-            SET app_status = 'approved' 
-            WHERE user_id = ? AND app_status = 'submitted'
-        """, (user_id,))
-        conn.commit()
-        
-        # Уведомляем пользователя
+    uid = app['user_id']
+    # ensure there are both types
+    counts = get_media_counts(app_id)
+    if decision == "approve":
+        if counts.get('normal', 0) < 1 or counts.get('intimate', 0) < 1:
+            bot.answer_callback_query(call.id, "Анкета неполная (требуется обычное + интимное).", show_alert=True)
+            return
+        set_application_status(app_id, 1, call.from_user.id)
+        # notify user
         try:
-            bot.send_message(
-                user_id,
-                "🎉 *Поздравляем!*\n\n"
-                "Ваша заявка *одобрена* администратором.\n"
-                f"Раздел: {section}\n\n"
-                "Теперь вам доступен полный функционал бота."
-            )
+            bot.send_message(uid,
+                             f"🎉 Ваша анкета #{app_id} одобрена. Вам открыт доступ ко всем разделам.")
         except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
-        
-        bot.edit_message_text(
-            f"✅ Заявка {user_id} одобрена\nРаздел: {section}",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-        
-        logger.info(f"Заявка одобрена: пользователь {user_id}")
-        
-    elif action == "reject":
-        # Отклоняем пользователя
-        set_user_status(user_id, "banned")
-        
-        # Обновляем статус заявки
-        cursor.execute("""
-            UPDATE applications 
-            SET app_status = 'rejected' 
-            WHERE user_id = ? AND app_status = 'submitted'
-        """, (user_id,))
-        conn.commit()
-        
-        # Уведомляем пользователя
+            logger.debug("Не удалось уведомить пользователя %s: %s", uid, e)
+        bot.answer_callback_query(call.id, "Анкета одобрена.")
+        # обновить сообщение модератора
         try:
-            bot.send_message(
-                user_id,
-                "🚫 *Заявка отклонена*\n\n"
-                "Администратор отклонил вашу заявку.\n"
-                f"Раздел: {section}\n\n"
-                "Вы больше не можете пользоваться ботом."
-            )
-        except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
-        
-        bot.edit_message_text(
-            f"❌ Заявка {user_id} отклонена\nРаздел: {section}",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-        
-        logger.info(f"Заявка отклонена: пользователь {user_id}")
-
-# ================= ЗАПУСК БОТА =================
-def main():
-    """Основная функция запуска бота"""
-    print("=" * 50)
-    print("🚀 ЗАПУСК TELEGRAM БОТА")
-    print("=" * 50)
-    
-    try:
-        # 1. Проверка одиночного запуска (уже выполнена в начале)
-        print("✅ Проверка одиночного экземпляра пройдена")
-        
-        # 2. Проверка подключения к Telegram API
-        if not check_telegram_connection():
-            print("❌ Не удалось подключиться к Telegram API")
-            cleanup_lock_file()
-            sys.exit(1)
-        
-        # 3. Проверка базы данных
-        cursor.execute("SELECT 1")
-        print("✅ База данных подключена")
-        
-        # 4. Запуск бота с явным логированием
-        print("\n" + "=" * 50)
-        print("🤖 БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ")
-        print("=" * 50)
-        print("Нажмите Ctrl+C для остановки\n")
-        
-        # Запуск polling с обработкой ошибок
-        bot.infinity_polling(
-            timeout=60,
-            long_polling_timeout=30,
-            logger_level=logging.INFO
-        )
-        
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Получен сигнал прерывания (Ctrl+C)")
-        print("Завершаем работу бота...")
-        
-    except telebot.apihelper.ApiTelegramException as e:
-        if "409" in str(e):
-            print("\n❌ КРИТИЧЕСКАЯ ОШИБКА: Обнаружен конфликт 409!")
-            print("Возможные причины:")
-            print("1. Другой экземпляр бота запущен после проверки")
-            print("2. Предыдущий процесс не завершился корректно")
-            print("3. Токен используется в другом месте")
-            print("\nРешение:")
-            print("1. Приостановите службу на Render")
-            print("2. Подождите 60 секунд")
-            print("3. Перезапустите бота")
-        else:
-            print(f"\n❌ Ошибка Telegram API: {e}")
-            
-    except sqlite3.Error as e:
-        print(f"\n❌ Ошибка базы данных: {e}")
-        
-    except Exception as e:
-        print(f"\n❌ Неожиданная ошибка: {e}")
-        
-    finally:
-        # Корректное завершение
-        print("\n" + "=" * 50)
-        print("🛑 ЗАВЕРШЕНИЕ РАБОТЫ БОТА")
-        print("=" * 50)
-        
-        # Закрытие соединений
-        try:
-            conn.close()
-            print("✅ Соединение с базой данных закрыто")
-        except:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"✅ Анкета #{app_id} одобрена администратором {call.from_user.first_name}")
+        except Exception:
             pass
-            
-        # Удаление lock-файла (автоматически через atexit)
-        sys.exit(0)
+    elif decision == "reject":
+        # полный бан пользователя
+        set_application_status(app_id, -1, call.from_user.id)
+        set_user_status(uid, 'banned')
+        try:
+            bot.send_message(uid, f"❌ Ваша анкета #{app_id} отклонена. Вы заблокированы.")
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Анкета отклонена и пользователь заблокирован.")
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"❌ Анкета #{app_id} отклонена. Пользователь заблокирован.")
+        except Exception:
+            pass
+    elif decision == "fix":
+        set_application_status(app_id, 2, call.from_user.id)  # needs_fix
+        set_user_status(uid, 'pending')
+        try:
+            bot.send_message(uid, f"✏️ Анкета #{app_id} требует исправлений. Пожалуйста, добавьте/замените файлы и нажмите 'Готово'.")
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Запрошены правки.")
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"✏️ Анкета #{app_id} помечена как needs_fix.")
+        except Exception:
+            pass
+
+def admin_view_application(call, app_id: int):
+    app = get_application(app_id)
+    if not app:
+        bot.answer_callback_query(call.id, "Анкета не найдена.", show_alert=True)
+        return
+    medias = db_execute("SELECT * FROM media WHERE application_id = ?", (app_id,), fetchall=True)
+    text = f"📋 Анкета #{app_id}\nПользователь: `{app['user_id']}`\nРаздел: {app['section']}\nСтатус: {app['status']}\n\nМедиа:\n"
+    counts = get_media_counts(app_id)
+    text += f"Обычных: {counts.get('normal',0)}, Интимных: {counts.get('intimate',0)}\n"
+    try:
+        bot.send_message(call.from_user.id, text)
+        # отправляем медиа (если есть)
+        for m in medias:
+            try:
+                if m['kind'] == 'photo':
+                    bot.send_photo(call.from_user.id, m['file_id'])
+                elif m['kind'] == 'video':
+                    bot.send_video(call.from_user.id, m['file_id'])
+                elif m['kind'] == 'animation':
+                    bot.send_animation(call.from_user.id, m['file_id'])
+            except Exception as e:
+                logger.debug("Не удалось отправить медиа админу: %s", e)
+    except Exception as e:
+        logger.error("Ошибка при отправке заявки админу: %s", e)
+    bot.answer_callback_query(call.id, "Отправлено в личку.")
+
+# ---------- Доп. команды /admin, /status, /my, /reset ----------
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message):
+    uid = message.from_user.id
+    if uid not in ADMIN_IDS:
+        bot.reply_to(message, "Доступ запрещён.")
+        return
+    # show simple admin keyboard
+    bot.reply_to(message, "Админ-панель:", reply_markup=kb_admin_main())
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_pending")
+def cb_admin_pending(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "Нет прав", show_alert=True)
+        return
+    pending = db_execute("""
+        SELECT a.id, a.user_id, a.section, a.created_at, u.username, u.first_name
+        FROM applications a LEFT JOIN users u ON a.user_id = u.user_id
+        WHERE a.status = 0 ORDER BY a.created_at DESC LIMIT 20
+    """, (), fetchall=True)
+    if not pending:
+        bot.send_message(call.from_user.id, "Нет ожидающих анкет.")
+        bot.answer_callback_query(call.id)
+        return
+    text = "⏳ Ожидающие анкеты:\n\n"
+    for p in pending:
+        text += f"#{p['id']} — {p['user_id']} ({p['username'] or '-'}) — {p['section']} — {p['created_at'][:16]}\n"
+    bot.send_message(call.from_user.id, text)
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    uid = message.from_user.id
+    user = get_user(uid)
+    if not user:
+        bot.reply_to(message, "Нужен /start")
+        return
+    app = get_active_application_for_user(uid)
+    text = f"Статус: {user['status']}\n"
+    if app:
+        counts = get_media_counts(app['id'])
+        text += f"Активная анкета #{app['id']}, раздел {app['section']}\nОбычных: {counts.get('normal',0)}, Интимных: {counts.get('intimate',0)}"
+        bot.reply_to(message, text, reply_markup=kb_media_actions(app['id']))
+    else:
+        bot.reply_to(message, text)
+
+@bot.message_handler(commands=["my"])
+def cmd_my(message):
+    uid = message.from_user.id
+    rows = db_execute("""
+        SELECT id, section, status, created_at FROM applications WHERE user_id = ? ORDER BY created_at DESC LIMIT 10
+    """, (uid,), fetchall=True)
+    if not rows:
+        bot.reply_to(message, "У вас нет анкет.")
+        return
+    text = "Ваши анкеты:\n\n"
+    status_map = {0: "pending", 1: "approved", -1: "rejected", 2: "needs_fix"}
+    for r in rows:
+        text += f"#{r['id']} — {r['section']} — {status_map.get(r['status'], r['status'])} — {r['created_at'][:16]}\n"
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=["reset"])
+def cmd_reset(message):
+    uid = message.from_user.id
+    # пользователь сбрасывает активную анкету (удаляем медиа и приложение)
+    app = get_active_application_for_user(uid)
+    if not app:
+        bot.reply_to(message, "Активной анкеты нет.")
+        return
+    db_execute("DELETE FROM media WHERE application_id = ?", (app['id'],))
+    db_execute("DELETE FROM applications WHERE id = ?", (app['id'],))
+    clear_user_state(uid)
+    bot.reply_to(message, "Анкета сброшена. Можете создать новую.")
+
+# ---------- Flask health-check ----------
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return "OK", 200
+
+@app.route("/admin-stats")
+def admin_stats():
+    key = request.args.get("key")
+    if not key or key != ADMIN_API_KEY:
+        return {"error": "Unauthorized"}, 401
+    total_users = db_execute("SELECT COUNT(*) as c FROM users", (), fetchone=True)['c']
+    pending_apps = db_execute("SELECT COUNT(*) as c FROM applications WHERE status = 0", (), fetchone=True)['c']
+    approved = db_execute("SELECT COUNT(*) as c FROM applications WHERE status = 1", (), fetchone=True)['c']
+    return {
+        "total_users": total_users,
+        "pending_apps": pending_apps,
+        "approved": approved,
+        "timestamp": datetime.now().isoformat()
+    }, 200
+
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# ---------- Сигналы и запуск ----------
+def signal_handler(signum, frame):
+    logger.info("Получен сигнал %s. Завершение.", signum)
+    sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    # Запуск Flask
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    # polling
+    logger.info("Запуск бота...")
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=30, allowed_updates=['message', 'callback_query'])
+    except Exception as e:
+        logger.error("Критическая ошибка polling: %s", e)
+        # уведомление админам
+        for aid in ADMIN_IDS:
+            try:
+                bot.send_message(aid, f"🚨 Бот упал: {str(e)[:200]}")
+            except Exception:
+                pass
+        sys.exit(1)
+
+
